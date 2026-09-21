@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "update_url": "http://dl.360tpcdn.com/cse/widevine_4_10_1582_1.7z",
+  "name": "WidevineCdm",
+  "description": "Widevine Content Decryption Module",
+  "version": "4.10.2391.0",
+  "minimum_chrome_version": "68.0.3430.0",
+  "x-cdm-module-versions": "4",
+  "x-cdm-interface-versions": "10",
+  "x-cdm-host-versions": "10",
+  "x-cdm-codecs": "vp8,vp09,avc1,av01",
+  "x-cdm-persistent-license-support": true,
+  "x-cdm-supported-encryption-schemes": [ "cenc", "cbcs" ],
+  "os": "win",
+  "arch":"x64"
+}
