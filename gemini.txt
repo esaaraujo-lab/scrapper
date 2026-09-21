@@ -1,0 +1,741 @@
+import subprocess
+import sys
+
+def install(pkg):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "--quiet"])
+
+print("Instalando dependências...")
+for pkg in ['beautifulsoup4', 'requests', 'yt-dlp', 'imageio-ffmpeg', 'pycryptodome']:
+    install(pkg)
+
+import pathlib
+import os
+import re
+import json
+import time
+import logging
+import requests
+import shutil
+import glob
+import threading
+import base64
+import unicodedata
+from urllib.parse import quote
+from bs4 import BeautifulSoup
+from typing import List, Dict, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import yt_dlp
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Tenta importar os parsers MP4/DataView locais
+try:
+    from util.DataViewReader import DataViewReader, Endianness
+    from util.Mp4Parser import Mp4Parser
+except ImportError:
+    try:
+        from DataViewReader import DataViewReader, Endianness
+        from Mp4Parser import Mp4Parser
+    except ImportError:
+        DataViewReader = None
+        Mp4Parser = None
+
+# Configuração do FFmpeg via imageio
+import imageio_ffmpeg
+ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+FFMPEG_DIR = os.path.dirname(ffmpeg_exe)
+os.environ['PATH'] = FFMPEG_DIR + os.pathsep + os.environ.get('PATH', '')
+
+# ============================================================================
+# CONFIGURAÇÕES DA APLICAÇÃO
+# ============================================================================
+BASE_DIR = pathlib.Path(r'D:/papaplata')
+BASE_URL = "https://www.papaconcursos.com.br"
+PORTAL   = f"{BASE_URL}/portal"
+TEMP_DIR = BASE_DIR / 'temp'
+CACHE_DIR = BASE_DIR
+
+for d in [BASE_DIR, TEMP_DIR, CACHE_DIR]:
+    os.makedirs(d, exist_ok=True)
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+logger = logging.getLogger(__name__)
+
+TIMEOUT           = 30
+RETRY_ATTEMPTS    = 3
+RETRY_ATTEMPTS_AI = 8
+CHUNK_SIZE        = 1024 * 256
+BATCH_DELAY       = 0.3
+MAX_VIDEO_WORKERS = 2
+MAX_PDF_WORKERS   = 5
+AI_POLL_INTERVAL  = 300
+
+KEYOS_AUTH = (
+    "PEtleU9TQXV0aGVudGljYXRpb25YTUw+CjxEYXRhPgogIDxHZW5lcmF0aW9uVGltZT4yMDI2LTA3LT"
+    "IzIDE2OjIwOjMyLjQ1ODwvR2VuZXJhdGlvblRpbWU+CiAgPEV4cGlyYXRpb25UaW1lPjIwMzQtMTAt"
+    "MDkgMTY6MjA6MzIuNDU4PC9FeHBprocGF0aW9uVGltZT4KICA8VW5pcXVlSWQ+YWIwM2IyYzY0NmZkYz"
+    "M4NDU3ODdmY2JmMGYwNWFjMjE8L1VuaXF1ZUlkPgogIDxSU0FQdWJLZXlJZD44YTc2OWIxMzEyNzlk"
+    "ZDkyNzQ3YjEzNTBkNzFiMWMwMjwvUlNBUHViS2V5SWQ+CiAgPFdpZGV2aW5lUG9saWN5IGZsX0Nhbl"
+    "BsYXk9InRydWUiIGZsX0NhblBlcnNpc3Q9ImZhbHNlIiAvPgogIDxXaWRldmluZUNvbnRlbnRLZXlT"
+    "cGVjIFRyYWNrVHlwZT0iSEQiPgogICAgPFNlY3VyaXR5TGV2ZWw+MTwvU2VjdXJpdHlMZXZlbD4K"
+    "ICA8L1dpZGV2aW5lQ29udGVudEtleVNwZWM+CiAgPEZhaXJQbGF5UG9saWN5IHBlcnNpc3RlbnQ9Im"
+    "ZhbHNlIiAvPgogIDxMaWNlbnNlIHR5cGU9InNpbXBsZSIgLz4KPC9EYXRhPgo8U2lnbmF0dXJlPlcx"
+    "SmwxSjNFT0ZxZHlTMUU5Y2FzWWF2ZVF5Yk1BZHdOTitpajhTNDZOTWQ3OHJEU3FLaGIxN2lUME1Jd"
+    "2srTTNQa0hUWGdjSGVUL0NVTnhNZXU3a3RZZlorbWdNMXZIZG9VbitIRExnZktDa2EySmNmVlV2Qy8v"
+    "cEZvWWxkOUFvLzl3ajJjWnZpckRvRFJHeVFiemZUYnZrREZpNTFVMk9wZ0NJYzErdDJXQmpSTWEyR3I"
+    "2QW13OVRDeW83b2gyYk9uYWZLTGhpQlpHbWFqcUk1Y3lsZlFyaWttYXc2aTNFdTZTeFcwb3MyTXhwSD"
+    "JDTFNpNkFnVFp3SkEwc1NJejJJWXFkNVFMQUU5cG9aTGxYNC9ndmJCNHlnZ1NxTnlMM2FaTzlITFVl"
+    "RjVmNWlYNklZQWFEb3VHdWZORGE0ZGtReERpeWozaXMrWXg1UjlONnZtNmlUZz09PC9TaWduYXR1cmU"
+    "+CjwvS2V5T1NBdXRoZW50aWNhdGlvblhNTD4="
+)
+
+HEADERS = {
+    'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
+    'referer': f'{BASE_URL}/portal',
+    'x-requested-with': 'XMLHttpRequest'
+}
+
+# ============================================================================
+# FUNÇÕES DE SANITIZAÇÃO E VALIDAÇÃO DE ARQUIVOS
+# ============================================================================
+def clear_name(n: str) -> str:
+    try:
+        n = n.encode('latin-1').decode('utf-8')
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        pass
+
+    nfkc = unicodedata.normalize('NFKC', n)
+    limpo = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', nfkc).strip().rstrip('.')
+
+    if limpo.lower().endswith('.pdf'):
+        limpo = limpo[:-4].rstrip()
+
+    return limpo
+
+def rename_if_needed(path: str) -> str:
+    dir_name, base_name = os.path.split(path)
+    clean_base = clear_name(base_name)
+    clean_path = os.path.join(dir_name, clean_base)
+
+    if path != clean_path and os.path.exists(path):
+        try:
+            os.rename(path, clean_path)
+        except Exception:
+            pass
+
+    return clean_path
+
+def create_folder(p: str) -> str:
+    parts = [clear_name(part) for part in pathlib.Path(p).parts]
+    clean_path = os.path.join(*parts)
+
+    original_path = os.path.join(*pathlib.Path(p).parts)
+    if os.path.exists(original_path) and original_path != clean_path:
+        try:
+            os.rename(original_path, clean_path)
+        except Exception:
+            pass
+
+    os.makedirs(clean_path, exist_ok=True)
+    return clean_path
+
+def is_valid_pdf(p: str) -> bool:
+    p = rename_if_needed(p)
+    if not os.path.exists(p):
+        return False
+    try:
+        with open(p, 'rb') as f:
+            return f.read(5).startswith(b'%PDF')
+    except Exception:
+        return False
+
+def is_video_complete(p: str) -> bool:
+    p = rename_if_needed(p)
+    return os.path.exists(p) and os.path.getsize(p) > 1024 * 1024
+
+# ============================================================================
+# PARSER E ENGINE DE PROCESSAMENTO DE DRM / MP4
+# ============================================================================
+class LocalVideoMerger:
+    @staticmethod
+    def extract_pssh_from_file(file_path: str) -> Optional[bytes]:
+        """Extrai o bloco PSSH Widevine dos primeiros bytes do fragmento MP4."""
+        if not os.path.exists(file_path):
+            return None
+        try:
+            with open(file_path, 'rb') as f:
+                header = f.read(100 * 1024)
+            
+            # Identificador do SystemID do Widevine: edef8ba9-79d6-4ace-a3c8-27dcd51d21ed
+            wv_system_id = bytes.fromhex("edef8ba979d64acea3c827dcd51d21ed")
+            pos = header.find(wv_system_id)
+            if pos != -1:
+                start = max(0, pos - 12)
+                size = int.from_hex(header[start:start+4].hex()) if pos >= 12 else 100
+                return header[start:start + size]
+        except Exception as e:
+            logger.debug(f"Falha ao extrair PSSH de {file_path}: {e}")
+        return None
+
+    @staticmethod
+    def merge_audio_video(temp_folder: str, output_path: str, key_hex: Optional[str] = None) -> bool:
+        """Sincroniza e mescla os arquivos temporários de áudio e vídeo em MP4 unificado."""
+        v_files = glob.glob(os.path.join(temp_folder, "*.fvideo-*.mp4")) or glob.glob(os.path.join(temp_folder, "*video*.mp4"))
+        a_files = glob.glob(os.path.join(temp_folder, "*.faudio-*.mp4")) or glob.glob(os.path.join(temp_folder, "*audio*.mp4"))
+
+        if not v_files or not a_files:
+            return False
+
+        v_file = max(v_files, key=os.path.getsize)
+        a_file = max(a_files, key=os.path.getsize)
+
+        cmd = [ffmpeg_exe, '-y']
+
+        if key_hex:
+            cmd.extend(['-decryption_key', key_hex])
+
+        cmd.extend([
+            '-i', v_file,
+            '-i', a_file,
+            '-c:v', 'copy',
+            '-c:a', 'copy',
+            '-movflags', '+faststart',
+            output_path
+        ])
+
+        try:
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+            if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 1024 * 100:
+                # Remove fragmentos baixados após a unificação bem-sucedida
+                for f in v_files + a_files:
+                    try: os.remove(f)
+                    except Exception: pass
+                return True
+            else:
+                logger.error(f"Erro na fusão do FFmpeg: {result.stderr.decode('utf-8', errors='ignore')[:200]}")
+        except Exception as e:
+            logger.error(f"Exceção ao executar o FFmpeg: {e}")
+
+        return False
+
+# ============================================================================
+# COLETOR DE ESTRUTURA E LINKS DA PLATAFORMA
+# ============================================================================
+class LinkCollector:
+    def __init__(self, session: requests.Session):
+        self.session = session
+
+    def collect_all_links(self, course_id: str, course_name: str, force_rebuild: bool = False) -> Dict:
+        cache_file = os.path.join(CACHE_DIR, f"{course_id}_links.json")
+        if os.path.exists(cache_file):
+            if force_rebuild:
+                logger.warning(f"force_rebuild — descartando cache: {course_name}")
+                os.remove(cache_file)
+            else:
+                with open(cache_file, 'r', encoding='utf-8') as f:
+                    cached = json.load(f)
+                if cached:
+                    logger.info(f"Cache recuperado: {course_name} ({len(cached)} aulas)")
+                    return cached
+                os.remove(cache_file)
+
+        logger.info(f"Coletando estrutura do curso: {course_name}")
+        root_items = self._get_root_items(course_id, course_name)
+        if not root_items:
+            raise RuntimeError(f"Sessão expirada ou course_id incorreto para '{course_name}'")
+
+        all_links: Dict = {}
+        for item_name, item_token in root_items.items():
+            self._recurse(item_token, course_id, clear_name(item_name), all_links)
+
+        if not all_links:
+            raise RuntimeError(f"0 aulas coletadas para '{course_name}' — verifique os cookies do Portal")
+
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            json.dump(all_links, f, ensure_ascii=False, indent=2)
+        logger.info(f"Mapeamento concluído e salvo: {len(all_links)} aulas")
+        return all_links
+
+    def _get_root_items(self, course_id: str, course_name: str) -> Dict[str, str]:
+        url  = f"{PORTAL}/curso-aula/produto-pacote/{course_id}/{course_name}"
+        resp = self.session.get(url, headers=HEADERS, timeout=TIMEOUT)
+        resp.raise_for_status()
+        if '<title>Login' in resp.text[:500]:
+            raise RuntimeError(
+                "\n╔══════════════════════════════════════════════════════════╗\n"
+                "║  SESSÃO EXPIRADA!  Atualize os cookies no navegador.    ║\n"
+                "║  Copie JSESSIONID e chave -> insira no método main()     ║\n"
+                "╚══════════════════════════════════════════════════════════╝"
+            )
+        soup  = BeautifulSoup(resp.content, 'html.parser')
+        items = {}
+
+        for div in soup.find_all('div', class_=lambda c: c and 'header-wrapper' in c and 'primary' in c):
+            target = div.get('data-target', '')
+            m = re.search(r'#(item-[a-f0-9]+-[a-f0-9]+)$', target)
+            if not m: continue
+            h3 = div.find('h3')
+            if not h3: continue
+            for badge in h3.find_all('span', class_='badge'): badge.decompose()
+            name = h3.get_text(strip=True)
+            if name: items[name] = m.group(1)
+
+        if not items:
+            for li in soup.find_all('li', class_=lambda c: c and 'item-tree' in c):
+                text  = li.get_text(strip=True).split('Disponível')[0].strip()
+                parts = li.get('onclick', '').split("'")
+                token = parts[1] if len(parts) > 1 else None
+                if token: items[text] = token
+
+        return items
+
+    def _recurse(self, token: str, course_id: str, path: str, all_links: Dict):
+        try:
+            data = self._get_topico(token)
+        except Exception as e:
+            logger.warning(f"Erro getTopico ({token}): {e}")
+            return
+
+        parent_token_from_api = data.get('token', token)
+
+        for sub in data.get('listTopics', []):
+            sub_token = f"{parent_token_from_api}-{sub['token']}"
+            self._recurse(sub_token, course_id, os.path.join(path, clear_name(sub['nome'])), all_links)
+
+        for item in data.get('listTopicsMedia', []):
+            self._process_media_item(item, parent_token_from_api, course_id, path, all_links)
+
+    def _process_media_item(self, item: dict, parent_token: str, course_id: str, path: str, all_links: Dict):
+        titulo     = item.get('titulo', 'sem-titulo')
+        item_title = clear_name(titulo)
+        media_token = f"{parent_token}-{item['token']}"
+
+        video_to = item.get('videoTO') or {}
+        id_video = video_to.get('param') or video_to.get('id')
+
+        video_url, is_drm = self._get_video_url(media_token, titulo)
+        materials = self._get_materials(item['token'], course_id)
+
+        lesson_key = os.path.join(path, item_title)
+        all_links[lesson_key] = {
+            'video':     video_url,
+            'is_drm':    is_drm,
+            'id_video':  id_video,
+            'materials': materials,
+        }
+        drm_tag = ' [DRM Widevine]' if is_drm else ''
+        logger.info(f"  ✓ {lesson_key} | vídeo={'sim'+drm_tag if video_url else 'não'} | PDFs={len(materials)}")
+
+    def _get_video_url(self, media_token: str, titulo: str) -> Tuple[Optional[str], bool]:
+        try:
+            resp = self.session.get(f"{PORTAL}/media", params={'token': media_token}, headers=HEADERS, timeout=TIMEOUT)
+            resp.raise_for_status()
+        except Exception as e:
+            logger.warning(f"Erro media ({titulo}): {e}")
+            return None, False
+
+        text = resp.text
+
+        m = re.search(r'(https?://[^\s\'"<>]+/master\.m3u8[^\s\'"<>]*)', text)
+        if m: return m.group(1), False
+        m = re.search(r'(https?://[^\s\'"<>]+\.m3u8[^\s\'"<>]*)', text)
+        if m: return m.group(1), False
+
+        soup = BeautifulSoup(resp.content, 'html.parser')
+        VIDEO_DOMAINS = ('videotecaead.com.br', 'embed.videotecaead.com.br', 'player.videotecaead.com.br', 'videoteca')
+
+        for iframe in soup.find_all('iframe'):
+            src = iframe.get('src', '')
+            if not any(d in src for d in VIDEO_DOMAINS): continue
+            try:
+                vid_resp = self.session.get(src, headers=HEADERS, timeout=TIMEOUT)
+                vid_soup = BeautifulSoup(vid_resp.content, 'html.parser')
+
+                for script in vid_soup.find_all('script'):
+                    mo = re.search(r'(https?://[^\s\'"<>]+\.m3u8[^\s\'"<>]*)', script.string or '')
+                    if mo: return mo.group(1), False
+
+                mo = re.search(r'(https?://[^\s\'"<>]+\.m3u8[^\s\'"<>]*)', vid_resp.text)
+                if mo: return mo.group(1), False
+
+                # Detecção do manifesto MPD com DRM
+                mo = re.search(r"const\s+manifestUrl\s*=\s*'(https?://[^']+\.mpd[^']*)'", vid_resp.text)
+                if mo:
+                    mpd_url = mo.group(1)
+
+                    # Tentativa de fallback para o player antigo desprotegido (sem DRM)
+                    title_m = re.search(r'<title>([^<]+)</title>', vid_resp.text)
+                    if title_m:
+                        raw_title = title_m.group(1).replace('.mp4', '').strip()
+                        slug = self._title_to_slug(raw_title)
+                        old_url = f"https://embed.videotecaead.com.br/papaconcursos/{slug}"
+                        try:
+                            old_resp = self.session.get(old_url, headers=HEADERS, timeout=TIMEOUT)
+                            if old_resp.status_code == 200:
+                                for s in BeautifulSoup(old_resp.content, 'html.parser').find_all('script'):
+                                    moo = re.search(r'(https?://[^\s\'"<>]+\.m3u8[^\s\'"<>]*)', s.string or '')
+                                    if moo:
+                                        logger.info(f"  ✓ Redirecionado para player sem DRM: {moo.group(1)[:60]}")
+                                        return moo.group(1), False
+                                moo = re.search(r'(https?://[^\s\'"<>]+\.m3u8[^\s\'"<>]*)', old_resp.text)
+                                if moo: return moo.group(1), False
+                        except Exception:
+                            pass
+
+                    return mpd_url, True
+
+            except Exception as e:
+                logger.warning(f"Erro ao analisar iframe ({titulo}): {e}")
+
+        return None, False
+
+    def _get_materials(self, topico_token: str, course_id: str) -> List[dict]:
+        materials = []
+        try:
+            resp = self.session.get(
+                f"{PORTAL}/getDocumentoTopico",
+                params={'format': 'json', 'token': topico_token, 'tokenCurso': course_id,
+                        'flagAI': '0-1-1-1-1-1-1-1-1-1-1-1-1-1-1-', 'flagTranscricao': '1'},
+                headers=HEADERS, timeout=TIMEOUT)
+            resp.raise_for_status()
+            resp.encoding = 'utf-8'
+            for doc in (resp.json() or []):
+                tipo  = doc.get('tipo', '')
+                token = doc.get('token')
+                nome  = clear_name(doc.get('nome', tipo))
+                token_invalido = not token or str(token).strip() in ('', 'null', 'None', tipo)
+
+                if tipo in ('D', 'L') and token:
+                    materials.append({
+                        'url':  f"{PORTAL}/documento-online-key?idDocumento={token}&tipo=D&token={course_id}",
+                        'nome': nome, 'tipo': tipo
+                    })
+                elif tipo == 'T' and token:
+                    materials.append({
+                        'url':  f"{PORTAL}/getTranscricao?format=json&token={token}",
+                        'nome': nome or 'Transcricao', 'tipo': tipo
+                    })
+                elif tipo == 'A-1':
+                    if not token_invalido:
+                        materials.append({
+                            'url':  f"{PORTAL}/getTranscricao?format=json&token={token}",
+                            'nome': nome or 'Transcricao IA', 'tipo': tipo
+                        })
+                    else:
+                        materials.append({
+                            'needs_generation': True,
+                            'ai_type': 'transcricao',
+                            'endpoint': f"{PORTAL}/gerarAITranscricao",
+                            'nome': clear_name('Transcricao IA'), 'tipo': tipo,
+                            'token': None
+                        })
+                elif tipo == 'A-3':
+                    if not token_invalido:
+                        materials.append({
+                            'url':  f"{PORTAL}/getEbookAI?token={token}",
+                            'nome': nome or 'Ebook IA', 'tipo': tipo
+                        })
+                    else:
+                        materials.append({
+                            'needs_generation': True,
+                            'ai_type': 'ebook',
+                            'endpoint': f"{PORTAL}/gerarAIEbook",
+                            'nome': clear_name('Ebook IA'), 'tipo': tipo,
+                            'token': None
+                        })
+        except Exception as e:
+            logger.debug(f"Erro getDocumentoTopico ({topico_token}): {e}")
+        return materials
+
+    def _title_to_slug(self, title: str) -> str:
+        nfkd   = unicodedata.normalize('NFKD', title)
+        ascii_ = nfkd.encode('ASCII', 'ignore').decode().upper()
+        clean  = re.sub(r'[^A-Z0-9\s\-]', '', ascii_)
+        parts  = [p.strip() for p in clean.split('-') if p.strip()]
+        return '-'.join(p.replace(' ', '_') for p in parts)
+
+    def _get_topico(self, token: str) -> dict:
+        resp = self.session.get(f"{PORTAL}/getTopico", params={'format': 'json', 'token': token}, headers=HEADERS, timeout=TIMEOUT)
+        resp.raise_for_status()
+        resp.encoding = 'utf-8'
+        return resp.json()
+
+# ============================================================================
+# GERENCIADOR DE DOWNLOADS E INTEGRAÇÃO DRM
+# ============================================================================
+class PapaDownloader:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update(HEADERS)
+
+    def login(self, email: str, jsessionid: str, chave: str):
+        self.session.cookies.set('email', email)
+        self.session.cookies.set('JSESSIONID', jsessionid)
+        self.session.cookies.set('chave', chave)
+        logger.info("Sessão inicializada com sucesso")
+
+    def download_course(self, course_id: str, course_name: str):
+        course_dir = create_folder(os.path.join(str(BASE_DIR), clear_name(course_name)))
+        collector  = LinkCollector(self.session)
+        try:
+            links = collector.collect_all_links(course_id, course_name, force_rebuild=False)
+        except RuntimeError as e:
+            logger.error(f"✗ {e}")
+            return
+
+        logger.info(f"Processando {len(links)} aulas do curso '{course_name}'")
+
+        video_tasks: List[Tuple[str, str, bool]] = []
+        pdf_tasks:   List[Tuple[str, str]] = []
+        ai_pending:  List[dict] = []
+
+        for rel_path, data in links.items():
+            lesson_dir = create_folder(os.path.join(course_dir, rel_path))
+
+            if data.get('video'):
+                vf = os.path.join(lesson_dir, '001 - aula.mp4')
+                if not is_video_complete(vf):
+                    video_tasks.append((data['video'], vf, data.get('is_drm', False)))
+                else:
+                    logger.info(f"Vídeo completo ignorado (já existe): {rel_path}")
+
+            mat_dir = create_folder(os.path.join(lesson_dir, 'material'))
+            mat_idx = 1
+            for mat in data.get('materials', []):
+                if isinstance(mat, str):
+                    mat_file = os.path.join(mat_dir, f"{mat_idx:03d} - material.pdf")
+                    mat_idx += 1
+                    mat_file = rename_if_needed(mat_file)
+                    if is_valid_pdf(mat_file): continue
+                    pdf_tasks.append((mat, mat_file))
+                    continue
+
+                if mat.get('needs_generation'):
+                    if data.get('id_video'):
+                        ai_pending.append({
+                            'id_video':   data['id_video'],
+                            'ai_type':    mat['ai_type'],
+                            'endpoint':   mat['endpoint'],
+                            'course_id':  course_id,
+                            'lesson_dir': lesson_dir,
+                            'mat_dir':    mat_dir,
+                            'nome':       clear_name(mat['nome']),
+                            'mat_idx':    mat_idx,
+                            'token':      None,
+                        })
+                    mat_idx += 1
+                    continue
+
+                url  = mat.get('url', '')
+                nome = clear_name(mat.get('nome', 'material'))
+                mat_file = os.path.join(mat_dir, f"{mat_idx:03d} - {nome}.pdf")
+                mat_idx += 1
+                mat_file = rename_if_needed(mat_file)
+                if is_valid_pdf(mat_file): continue
+                if os.path.exists(mat_file): os.remove(mat_file)
+                pdf_tasks.append((url, mat_file))
+
+        if ai_pending:
+            logger.info(f"Disparando requisições de geração IA para {len(ai_pending)} itens...")
+            t = threading.Thread(target=self._fire_ai_generation, args=(ai_pending,), daemon=True)
+            t.start()
+
+        if pdf_tasks:
+            logger.info(f"Baixando {len(pdf_tasks)} PDFs...")
+            with ThreadPoolExecutor(max_workers=MAX_PDF_WORKERS) as pool:
+                futs = {pool.submit(self._download_pdf, u, p): p for u, p in pdf_tasks}
+                for f in as_completed(futs):
+                    if f.result(): logger.info(f"PDF salvo: {os.path.basename(futs[f])}")
+                    time.sleep(BATCH_DELAY)
+
+        if video_tasks:
+            logger.info(f"Baixando {len(video_tasks)} vídeos...")
+            stop_poll = threading.Event()
+            poll_t = threading.Thread(target=self._ai_poll_loop, args=(ai_pending, stop_poll), daemon=True)
+            poll_t.start()
+
+            with ThreadPoolExecutor(max_workers=MAX_VIDEO_WORKERS) as pool:
+                futs = [pool.submit(self._download_video, u, p, drm) for u, p, drm in video_tasks]
+                for f in as_completed(futs): f.result()
+
+            stop_poll.set()
+            poll_t.join(timeout=10)
+
+        if ai_pending:
+            logger.info("Varredura final de arquivos IA...")
+            self._poll_and_download_ai(ai_pending)
+
+        logger.info(f"✅ Concluído com sucesso: {course_name}")
+
+    def _fire_ai_generation(self, ai_pending: List[dict]):
+        for entry in ai_pending:
+            try:
+                resp = self.session.post(entry['endpoint'], data={'idVideo': entry['id_video']}, headers=HEADERS, timeout=180)
+                tok = resp.json().get('token')
+                entry['token'] = tok
+            except Exception as e:
+                logger.debug(f"Falha na requisição de geração IA: {e}")
+            time.sleep(0.5)
+
+    def _ai_poll_loop(self, ai_pending: List[dict], stop: threading.Event):
+        while not stop.wait(timeout=AI_POLL_INTERVAL):
+            self._poll_and_download_ai(ai_pending)
+
+    def _poll_and_download_ai(self, ai_pending: List[dict]):
+        for entry in ai_pending:
+            tok = entry.get('token')
+            if not tok:
+                try:
+                    resp = self.session.post(entry['endpoint'], data={'idVideo': entry['id_video']}, headers=HEADERS, timeout=180)
+                    tok = resp.json().get('token')
+                    if tok: entry['token'] = tok
+                except Exception:
+                    pass
+            if not tok: continue
+
+            mat_dir  = entry.get('mat_dir') or create_folder(os.path.join(entry['lesson_dir'], 'material'))
+            nome     = clear_name(entry.get('nome', 'IA'))
+            idx      = entry.get('mat_idx', 99)
+            mat_file = rename_if_needed(os.path.join(mat_dir, f"{idx:03d} - {nome}.pdf"))
+            if is_valid_pdf(mat_file): continue
+
+            ai_type = entry.get('ai_type', 'transcricao')
+            url = f"{PORTAL}/getEbookAI?token={tok}" if ai_type == 'ebook' else f"{PORTAL}/getTranscricao?format=json&token={tok}"
+            if self._download_pdf(url, mat_file, retries=RETRY_ATTEMPTS_AI):
+                logger.info(f"  ✓ Material IA baixado: {nome}")
+
+    def _download_video(self, manifest_url: str, output_path: str, is_drm: bool = False):
+        rel_path  = os.path.relpath(output_path, str(BASE_DIR))
+        lesson_temp_dir = os.path.join(str(TEMP_DIR), os.path.dirname(rel_path))
+        os.makedirs(lesson_temp_dir, exist_ok=True)
+        
+        temp_base = os.path.join(lesson_temp_dir, os.path.basename(output_path).replace('.mp4', ''))
+        temp_outtmpl = temp_base + '.%(ext)s'
+
+        try:
+            ydl_opts = {
+                'ffmpeg_location':               FFMPEG_DIR,
+                'format':                        'bv*+ba/b',
+                'outtmpl':                       temp_outtmpl,
+                'quiet':                         True,
+                'no_warnings':                   True,
+                'retries':                       RETRY_ATTEMPTS,
+                'concurrent_fragment_downloads': 4,
+                'socket_timeout':                TIMEOUT,
+            }
+
+            if is_drm:
+                # Permite o download das faixas criptografadas sem abortar no yt-dlp
+                ydl_opts['http_headers'] = {'x-keyos-authorization': KEYOS_AUTH}
+                ydl_opts['allow_unplayable_formats'] = True
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([manifest_url])
+
+            # Procura o arquivo .mp4 resultante
+            candidates = [
+                f for f in glob.glob(temp_base + '.*')
+                if not f.endswith('.part') and not f.endswith('.ytdl') and os.path.isfile(f)
+            ]
+            
+            downloaded = (candidates or [None])[0]
+
+            # Caso haja fragmentos residuais (.fvideo e .faudio), tenta a unificação nativa
+            if is_drm or not (downloaded and os.path.exists(downloaded) and os.path.getsize(downloaded) > 100 * 1024):
+                merged_ok = LocalVideoMerger.merge_audio_video(lesson_temp_dir, output_path)
+                if merged_ok:
+                    logger.info(f"✓ Vídeo unificado com sucesso via FFmpeg: {os.path.basename(output_path)}")
+                    return
+
+            if downloaded and os.path.exists(downloaded) and os.path.getsize(downloaded) > 100 * 1024:
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                shutil.move(downloaded, output_path)
+                logger.info(f"✓ Vídeo salvo: {os.path.basename(output_path)}")
+            else:
+                logger.warning(f"⚠ Não foi possível concluir o download/fusão do vídeo: {os.path.basename(output_path)}")
+
+        except Exception as e:
+            logger.error(f"Falha ao baixar vídeo ({os.path.basename(output_path)}): {e}")
+
+    def _download_pdf(self, url: str, output_path: str, retries: int = RETRY_ATTEMPTS) -> bool:
+        output_path = rename_if_needed(output_path)
+        rel_path  = os.path.relpath(output_path, str(BASE_DIR))
+        temp_path = os.path.join(str(TEMP_DIR), rel_path)
+        os.makedirs(os.path.dirname(temp_path), exist_ok=True)
+
+        for attempt in range(retries):
+            try:
+                resp = self.session.get(url, timeout=TIMEOUT, verify=False)
+                if resp.status_code != 200:
+                    time.sleep(2 ** attempt)
+                    continue
+
+                ct = resp.headers.get('content-type', '').lower()
+
+                if 'application/json' in ct or 'text/plain' in ct or (resp.content[:1] in (b'{', b'[')):
+                    try:
+                        data = resp.json()
+                    except Exception:
+                        time.sleep(2 ** attempt)
+                        continue
+
+                    if not isinstance(data, dict):
+                        time.sleep(2 ** attempt)
+                        continue
+
+                    status = str(data.get('status', '')).lower()
+                    if status in ('processing', 'pending', 'gerando'):
+                        time.sleep(max(10, 2 ** attempt))
+                        continue
+
+                    if not data.get('url'):
+                        time.sleep(2 ** attempt)
+                        continue
+
+                    raw_url = data['url']
+                    pdf_url = raw_url if raw_url.startswith('http') else f"{BASE_URL}{quote(raw_url, safe=':/?=&')}"
+                    pdf_resp = self.session.get(pdf_url, stream=True, timeout=60, verify=False, allow_redirects=True)
+                    content  = pdf_resp.content
+                    if pdf_resp.status_code == 200 and content.startswith(b'%PDF'):
+                        with open(temp_path, 'wb') as f:
+                            f.write(content)
+                        shutil.move(temp_path, output_path)
+                        return True
+                    time.sleep(2 ** attempt)
+
+                elif resp.content.startswith(b'%PDF'):
+                    with open(temp_path, 'wb') as f:
+                        f.write(resp.content)
+                    shutil.move(temp_path, output_path)
+                    return True
+
+            except Exception as e:
+                time.sleep(2 ** attempt)
+
+        logger.error(f"✗ Falha ao baixar PDF: {os.path.basename(output_path)}")
+        return False
+
+# ============================================================================
+# EXECUTOR PRINCIPAL
+# ============================================================================
+def main():
+    downloader = PapaDownloader()
+    
+    # Atualizar com os cookies válidos
+    downloader.login(
+        email="fabianass@hotma.com.br",
+        jsessionid="DB7D627C2B33FB0F201B03B07EF14B4A",
+        chave="3707c478ec414cb1f68e450ee08635d6a745eb8470d07937ff07f3ae9e90ff99421ac2b83469babfb5fcff2ea1214fe8b182dfba77df26614c95776aa27642a0"
+    )
+
+    courses = [
+        {"id": "6f7a5134b435ccf84a972485bbd89fdf", "name": "isolada-direito-constitucional"},
+        {"id": "927e039b5965fe89845e6468bd154b63", "name": "isolada-direito-administrativo"},
+    ]
+
+    for course in courses:
+        logger.info(f"\n{'='*60}\nINICIANDO CURSO: {course['name']}\n{'='*60}")
+        downloader.download_course(course['id'], course['name'])
+
+if __name__ == "__main__":
+    main()
