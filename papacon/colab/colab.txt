@@ -1,0 +1,2326 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+papa_downloader.py — Código ÚNICO INTEGRADO do Papa Concursos Downloader
+=========================================================================
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import ssl
+import time
+import shutil
+import logging
+import subprocess
+import threading
+import unicodedata
+import urllib.request
+from pathlib import Path
+from datetime import datetime
+from typing import Optional, List, Dict, Tuple
+from urllib.parse import quote, urljoin
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+ssl._create_default_https_context = ssl._create_unverified_context
+SCRIPT_DIR = Path(__file__).resolve().parent if '__file__' in globals() else Path.cwd()
+sys.path.insert(0, str(SCRIPT_DIR))
+
+
+# ============================================================================
+# AUTO-INSTALL — instala tudo silenciosamente
+# ============================================================================
+def install_dependencies():
+    """Verifica e instala todas as dependências automaticamente."""
+    needed = []
+    for module, package in [
+        ('requests', 'requests'),
+        ('urllib3', 'urllib3'),
+        ('bs4', 'beautifulsoup4'),
+        ('yt_dlp', 'yt-dlp'),
+        ('selenium', 'selenium'),
+        ('charset_normalizer', 'charset-normalizer'),
+    ]:
+        try:
+            __import__(module)
+        except ImportError:
+            needed.append(package)
+    try:
+        import imageio_ffmpeg
+    except ImportError:
+        needed.append('imageio-ffmpeg')
+    if needed:
+        print(f"📦 Instalando: {', '.join(needed)}")
+        try:
+            subprocess.check_call(
+                [sys.executable, '-m', 'pip', 'install', '--quiet'] + needed,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            print("✅ Instalado!")
+        except Exception as e:
+            print(f"⚠ Erro: {e}. Rode: pip install {' '.join(needed)}")
+    # Colab setup (depois de instalar pra poder importar google.colab)
+    if 'google.colab' in str(getattr(sys, 'modules', {})):
+        _setup_colab()
+    elif sys.platform.startswith('linux') and not (
+        shutil.which('google-chrome') or shutil.which('chromium')
+    ):
+        try:
+            subprocess.check_call(
+                ['sudo', 'apt-get', 'install', '-y', '-qq', 'chromium', 'chromium-driver'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            print("✅ Chromium instalado!")
+        except Exception:
+            pass
+
+
+def _setup_colab():
+    """Google Colab: monta Drive + instala Google Chrome OFICIAL (não chromium)."""
+    print("🔵 Google Colab detectado...")
+    try:
+        from google.colab import drive
+        drive.mount('/content/drive')
+        print("✅ Google Drive montado!")
+    except Exception as e:
+        print(f"⚠ Drive: {e}")
+    try:
+        # Install Google Chrome OFFICIAL (not chromium)
+        subprocess.run(
+            ['wget', '-q', 'https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb'],
+            check=True,
+        )
+        subprocess.run(
+            ['dpkg', '-i', 'google-chrome-stable_current_amd64.deb'],
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            ['apt-get', 'install', '-y', '-f'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        print("✅ Google Chrome OFICIAL instalado!")
+    except Exception as e:
+        print(f"⚠ Chrome install: {e}")
+        # Fallback pra chromium se Chrome oficial falhar
+        try:
+            subprocess.check_call(
+                ['apt-get', 'install', '-y', '-qq', 'chromium', 'chromium-chromedriver'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            print("✅ Chromium instalado (fallback).")
+        except Exception as e2:
+            print(f"⚠ Chromium fallback: {e2}")
+
+
+def detect_environment():
+    """Detecta OS e configura paths. Retorna nome do ambiente."""
+    global BASE_DIR, TEMP_DIR, COOKIES_DIR, COOKIES_FILE
+    global CACHE_DIR, EBOOKS_DIR, LOGS_DIR, CURRENT_ENV
+    is_colab = 'google.colab' in str(getattr(sys, 'modules', {}))
+    if is_colab:
+        BASE_DIR = Path('/content/drive/Shareddrives/! Assinatura Papa Concursos/Cursos Papa Concursos/CURSOS 2026')
+        TEMP_DIR = Path('/content/papa_temp')
+        CURRENT_ENV = 'colab'
+    elif sys.platform == 'win32':
+        BASE_DIR = Path.cwd()
+        TEMP_DIR = (Path('D:/drivedepobre-temp')
+                    if Path('D:/drivedepobre-temp').exists()
+                    else Path(os.environ.get('TEMP', './papa_temp')))
+        CURRENT_ENV = 'windows'
+    elif sys.platform == 'darwin':
+        BASE_DIR = Path.cwd()
+        TEMP_DIR = Path.home() / 'Library/Caches/papa'
+        CURRENT_ENV = 'macos'
+    else:
+        BASE_DIR = Path.cwd()
+        TEMP_DIR = Path('/tmp/papa')
+        CURRENT_ENV = 'linux'
+    COOKIES_DIR = (Path.home() / "PapaConcursos_Downloads"
+                   if not is_colab else BASE_DIR)
+    COOKIES_FILE = COOKIES_DIR / "cookies_papa.json"
+    CACHE_DIR = BASE_DIR / 'cache'
+    EBOOKS_DIR = BASE_DIR / 'ebooks'
+    LOGS_DIR = BASE_DIR / 'logs'
+    for d in [BASE_DIR, TEMP_DIR, COOKIES_DIR, CACHE_DIR, EBOOKS_DIR, LOGS_DIR]:
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+    env = ('Colab' if is_colab
+           else ('Windows' if sys.platform == 'win32'
+                 else ('macOS' if sys.platform == 'darwin' else 'Linux')))
+    print(f"💻 {env} | Downloads: {BASE_DIR} | Temp: {TEMP_DIR}")
+    return env
+
+
+def find_ffmpeg() -> Optional[str]:
+    """Encontra ffmpeg no sistema."""
+    ff = shutil.which('ffmpeg') or shutil.which('ffmpeg.exe')
+    if ff:
+        return ff
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def ensure_html5_faststart(video_path: str):
+    """Garante que o vídeo é HTML5 + faststart (moov atom no início)."""
+    ffmpeg = find_ffmpeg()
+    if (not ffmpeg or not os.path.exists(video_path)
+            or os.path.getsize(video_path) < 10000):
+        return
+    try:
+        with open(video_path, 'rb') as f:
+            head = f.read(1024 * 100)
+        if b'moov' in head:
+            return  # já tem faststart
+    except Exception:
+        return
+    tmp = video_path + '.tmp.mp4'
+    try:
+        subprocess.run(
+            [ffmpeg, '-y', '-i', video_path, '-c', 'copy',
+             '-movflags', '+faststart', tmp],
+            capture_output=True, timeout=120,
+        )
+        if os.path.exists(tmp) and os.path.getsize(tmp) > 10000:
+            os.replace(tmp, video_path)
+            logger.info(f"  ✅ Faststart: {os.path.basename(video_path)}")
+        elif os.path.exists(tmp):
+            os.remove(tmp)
+    except Exception as e:
+        logger.warning(f"  ⚠ Faststart falhou: {e}")
+
+
+# ============================================================================
+# LOGGER
+# ============================================================================
+logger = logging.getLogger("papa_dl")
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter(
+        '%(asctime)s | %(levelname)s | %(message)s', '%H:%M:%S'))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+
+# ============================================================================
+# CONFIGURAÇÃO
+# ============================================================================
+BASE_URL = "https://www.papaconcursos.com.br"
+PORTAL_NEW = "https://portal2025.papaconcursos.com.br/portal"
+PORTAL_OLD = f"{BASE_URL}/portal"
+# LOGIN: o portal do aluno (portal2025) é onde fica o form #formLogin real.
+LOGIN_URL = f"{PORTAL_NEW}/login"
+LOGIN_ACTION_URL = f"{PORTAL_NEW}/validar-login"
+# Página de listagem de cursos (NOVO: www, não portal2025!)
+CURSOS_URL = f"{BASE_URL}/portal/cursos"
+MEUS_CURSOS_URL = f"{PORTAL_NEW}/meus-cursos"
+TRIAL_REG_URL = f"{BASE_URL}/adicionar/teste-assinatura-ilimitada-gratis"
+FOURDEVS_URL = "https://www.4devs.com.br/ferramentas_online.php"
+
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "Chrome/124.0.0.0 Safari/537.36")
+
+HEADERS = {
+    'user-agent': USER_AGENT,
+    'accept-charset': 'utf-8,iso-8859-1;q=0.9,*;q=0.8',
+    'referer': f'{PORTAL_NEW}',
+    'x-requested-with': 'XMLHttpRequest',
+}
+
+# Defaults — detect_environment() reatribui em runtime
+BASE_DIR = Path.cwd()
+TEMP_DIR = Path(os.environ.get("PAPA_TEMP_DIR", "D:/drivedepobre-temp"))
+COOKIES_DIR = Path.home() / "PapaConcursos_Downloads"
+COOKIES_FILE = COOKIES_DIR / "cookies_papa.json"
+CACHE_DIR = BASE_DIR / 'cache'
+EBOOKS_DIR = BASE_DIR / 'ebooks'
+LOGS_DIR = BASE_DIR / 'logs'
+CURRENT_ENV = 'unknown'
+
+# Constantes operacionais (de papa2026.py + ISOLADAS 2026.py)
+BATCH_DELAY = 0.3
+RETRY_ATTEMPTS = 3
+CHUNK_SIZE = 1024 * 256
+TIMEOUT = 30
+MAX_VIDEO_WORKERS = 2
+MAX_PDF_WORKERS = 5
+AI_POLL_INTERVAL = 300  # 5 min
+
+# Credenciais hardcoded (atualizadas quando cria nova conta)
+HARDCODED_EMAIL = ""
+HARDCODED_JSESSIONID = ""
+HARDCODED_CHAVE = ""
+
+# Dependências
+try:
+    import requests
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    REQUESTS_OK = True
+except ImportError:
+    REQUESTS_OK = False
+
+try:
+    from bs4 import BeautifulSoup
+    BS4_OK = True
+except ImportError:
+    BS4_OK = False
+
+try:
+    import yt_dlp
+    YT_DLP_OK = True
+except ImportError:
+    YT_DLP_OK = False
+
+try:
+    import imageio_ffmpeg
+    FFMPEG_DIR = os.path.dirname(imageio_ffmpeg.get_ffmpeg_exe())
+    os.environ['PATH'] = FFMPEG_DIR + os.pathsep + os.environ.get('PATH', '')
+except Exception:
+    FFMPEG_DIR = ''
+    _ff = find_ffmpeg()
+    if _ff:
+        FFMPEG_DIR = os.path.dirname(_ff)
+        os.environ['PATH'] = FFMPEG_DIR + os.pathsep + os.environ.get('PATH', '')
+
+try:
+    from charset_normalizer import from_bytes as _from_bytes
+    CHARSET_NORMALIZER_OK = True
+except ImportError:
+    CHARSET_NORMALIZER_OK = False
+
+SELENIUM_OK = False
+try:
+    from selenium import webdriver
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.chrome.options import Options
+    SELENIUM_OK = True
+except ImportError:
+    pass
+
+
+# ============================================================================
+# UTILS — encoding (de gemini.py/papa_concursos.2026.py)
+# ============================================================================
+def safe_decode(data, fallback: str = 'utf-8') -> str:
+    """Decodifica bytes testando múltiplos encodings."""
+    if isinstance(data, str):
+        return data
+    if not isinstance(data, bytes):
+        return str(data)
+    for enc in ('utf-8', 'utf-8-sig', 'windows-1252', 'iso-8859-1', 'cp1252'):
+        try:
+            return data.decode(enc)
+        except (UnicodeDecodeError, AttributeError):
+            continue
+    return data.decode('utf-8', errors='replace')
+
+
+def fix_mojibake(text: str) -> str:
+    """Corrige dupla codificação UTF-8 (mojibake) tipo 'Ã©' -> 'é'."""
+    if not isinstance(text, str):
+        return text
+    try:
+        fixed = text.encode('latin-1', errors='ignore').decode('utf-8', errors='ignore')
+        if fixed and fixed != text:
+            accented_orig = sum(1 for c in text
+                                if unicodedata.category(c).startswith('L') and ord(c) > 127)
+            accented_fixed = sum(1 for c in fixed
+                                 if unicodedata.category(c).startswith('L') and ord(c) > 127)
+            if accented_fixed >= accented_orig:
+                return fixed
+    except Exception:
+        pass
+    return text
+
+
+def normalize_text(text) -> str:
+    """Normaliza Unicode preservando acentos do português (NFC + corrige mojibake)."""
+    if not isinstance(text, str):
+        text = str(text)
+    text = fix_mojibake(text)
+    text = unicodedata.normalize('NFC', text)
+    text = ''.join(
+        c for c in text
+        if unicodedata.category(c) not in ('Cc', 'Cf') or c in '\t\n\r'
+    )
+    return unicodedata.normalize('NFC', text)
+
+
+def clear_name(name: str, maxlen: int = 120) -> str:
+    """Limpa nomes de arquivos/pastas MANTENDO ACENTOS."""
+    if not name:
+        return 'recurso'
+    if isinstance(name, bytes):
+        name = safe_decode(name)
+    name = normalize_text(name)
+    # Remove extensões conhecidas
+    name = re.sub(r'\.(pdf|docx?|xlsx?|pptx?|mp4|mkv|webm)$', '', name, flags=re.IGNORECASE)
+    # Remove apenas caracteres inválidos em filesystem
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name).strip()
+    name = re.sub(r'\s+', ' ', name)
+    return name[:maxlen].rstrip(' .') or 'recurso'
+
+
+def create_folder(path: str) -> str:
+    path = normalize_text(str(path))
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def is_valid_pdf(path: str) -> bool:
+    try:
+        if not os.path.exists(path) or os.path.getsize(path) < 1000:
+            return False
+        with open(path, 'rb') as f:
+            return f.read(4) == b'%PDF'
+    except Exception:
+        return False
+
+
+def is_video_complete(path: str, min_size: int = 1024 * 1024) -> bool:
+    try:
+        return os.path.exists(path) and os.path.getsize(path) >= min_size
+    except Exception:
+        return False
+
+
+# ============================================================================
+# SESSÃO HTTP (plain requests — NÃO cloudscraper pra evitar erro SSL)
+# ============================================================================
+def create_session():
+    """Cria sessão HTTP. Usa requests.Session() puro (NÃO cloudscraper)."""
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    logger.info("🌐 Usando requests.Session (plain HTTP)")
+    return s
+
+
+def set_cookies_on_session(session, email, jsessionid, chave):
+    """Seta cookies em 3 domínios. Seta 'chave' E '_tag' (Papa usa ambos nomes)."""
+    for domain in ['.papaconcursos.com.br',
+                   'www.papaconcursos.com.br',
+                   'portal2025.papaconcursos.com.br']:
+        try:
+            session.cookies.set('email', email, domain=domain, path='/')
+            session.cookies.set('JSESSIONID', jsessionid, domain=domain, path='/')
+            session.cookies.set('chave', chave, domain=domain, path='/')
+            session.cookies.set('_tag', chave, domain=domain, path='/')
+        except Exception:
+            pass
+
+
+def check_session(session) -> bool:
+    """Verifica se a sessão é válida."""
+    try:
+        resp = session.get(f"{PORTAL_NEW}/meus-cursos", timeout=15, verify=False,
+                           allow_redirects=False)
+        if resp.status_code == 200 and '<title>Login' not in resp.text[:500]:
+            return True
+        if resp.status_code in (301, 302):
+            loc = resp.headers.get('Location', '')
+            if 'login' not in loc.lower():
+                return True
+        return False
+    except Exception as e:
+        logger.warning(f"Erro ao verificar sessão: {e}")
+        return False
+
+
+# ============================================================================
+# 4DEVS — GERA PESSOA FICTÍCIA
+# ============================================================================
+def gerar_pessoa_4devs() -> dict:
+    """Gera pessoa fictícia via 4devs.com.br. Retorna dict com nome, cpf, etc."""
+    logger.info("👤 Gerando pessoa fictícia via 4devs...")
+    try:
+        s = requests.Session()
+        s.headers.update({
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Referer': 'https://www.4devs.com.br/gerador_de_pessoas',
+            'User-Agent': USER_AGENT,
+            'X-Requested-With': 'XMLHttpRequest',
+        })
+        data = {
+            'acao': 'gerar_pessoa',
+            'sexo': '',
+            'pontuacao': 'N',
+            'idade': '',
+            'cep_estado': '',
+            'txt_qtde': '1',
+        }
+        resp = s.post(FOURDEVS_URL, data=data, timeout=15, verify=False)
+        if resp.status_code != 200:
+            logger.error(f"❌ 4devs HTTP {resp.status_code}")
+            return {}
+        pessoas = resp.json()
+        if not pessoas or not isinstance(pessoas, list):
+            logger.error("❌ 4devs não retornou pessoa")
+            return {}
+        p = pessoas[0]
+        logger.info(f"   ✓ {p.get('nome', '?')} | CPF: {p.get('cpf', '?')}")
+        return p
+    except Exception as e:
+        logger.error(f"❌ Erro 4devs: {e}")
+        return {}
+
+
+def montar_conta(pessoa: dict) -> dict:
+    """Monta conta trial a partir da pessoa do 4devs."""
+    import random
+    import string
+    DOMINIOS = [
+        'gmail.com', 'hotmail.com', 'outlook.com', 'uol.com.br',
+        'terra.com.br', 'ig.com.br', 'yahoo.com', 'yahoo.com.br',
+        'icloud.com', 'bol.com.br',
+    ]
+    nome_limpo = clear_name(pessoa.get('nome', 'teste')).lower().replace(' ', '.')
+    # limpa acentos do email pra evitar problemas com servidores de email
+    nfkd = unicodedata.normalize('NFKD', nome_limpo)
+    nome_limpo = nfkd.encode('ASCII', 'ignore').decode('ASCII')
+    sufixo = ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
+    dominio = random.choice(DOMINIOS)
+    email = f"{nome_limpo}.{sufixo}@{dominio}"
+    senha = ''.join(random.choices(string.ascii_letters + string.digits + '!@#$%', k=10))
+    tel = pessoa.get('celular', '').strip()
+    if not tel or len(tel) < 8:
+        tel = f"({random.randint(11, 89)}) 9{random.randint(1000, 9999)}-{random.randint(1000, 9999)}"
+    dn = pessoa.get('data_nasc', '').strip()
+    if not dn:
+        dn = f"{random.randint(1, 28):02d}/{random.randint(1, 12):02d}/{random.randint(1980, 2000)}"
+    conta = {
+        'nome': pessoa.get('nome', 'Teste'),
+        'email': email,
+        'senha': senha,
+        'senha2': senha,
+        'telefoneCelular': tel,
+        'cpf': re.sub(r'\D', '', pessoa.get('cpf', '00000000000')),
+        'dataNascimento': dn,
+        'propaganda': 'S',
+    }
+    logger.info(f"   ✓ Email: {email}")
+    logger.info(f"   ✓ Senha: {senha[:3]}***")
+    return conta
+
+
+# ============================================================================
+# TRIAL CREATION — HTTP POST (tenta sem Selenium primeiro)
+# ============================================================================
+def criar_conta_http(conta: dict) -> bool:
+    """Tenta criar conta trial via HTTP POST. Retorna True se sucesso."""
+    logger.info("📝 Tentando criar conta trial via HTTP POST...")
+    try:
+        s = create_session()
+        s.get(TRIAL_REG_URL, timeout=15, verify=False)
+        form_data = {
+            'nome': conta['nome'],
+            'email': conta['email'],
+            'telefoneCelular': conta['telefoneCelular'],
+            'cpf': conta['cpf'],
+            'senha': conta['senha'],
+            'senha2': conta['senha2'],
+            'dataNascimento': conta['dataNascimento'],
+            'propaganda': conta['propaganda'],
+            'g-recaptcha-response': '',
+        }
+        resp = s.post(f"{BASE_URL}/realizarPagamento", data=form_data,
+                      timeout=30, verify=False, allow_redirects=True)
+        if '/portal/' in resp.url or '/minhas-compras' in resp.url:
+            logger.info("   ✓ Conta criada via HTTP!")
+            return True
+        try:
+            data = resp.json()
+            if data.get('retorno') == 1:
+                logger.info("   ✓ Conta criada via HTTP (JSON)!")
+                return True
+        except Exception:
+            pass
+        logger.warning("⚠ HTTP POST falhou (provável reCAPTCHA obrigatório)")
+        return False
+    except Exception as e:
+        logger.warning(f"⚠ Erro HTTP POST: {e}")
+        return False
+
+
+# ============================================================================
+# LOGIN — HTTP POST (tenta sem Selenium primeiro)
+# ============================================================================
+def login_http(email: str, senha: str) -> Optional[dict]:
+    """Tenta login via HTTP POST. Retorna {email, jsessionid, chave} se sucesso."""
+    logger.info(f"🔑 Tentando login HTTP: {email}")
+    try:
+        s = create_session()
+        s.get(LOGIN_URL, timeout=15, verify=False)
+        form_data = {
+            'login': email,
+            'senha': senha,
+            'method': 'login',
+            'g-recaptcha-response': '',
+        }
+        resp = s.post(LOGIN_ACTION_URL, data=form_data,
+                      timeout=30, verify=False, allow_redirects=True)
+        if 'login' not in resp.url.lower() and '<title>Login' not in resp.text[:500]:
+            jsessionid = None
+            chave = None
+            for c in s.cookies:
+                if c.name == 'JSESSIONID':
+                    jsessionid = c.value
+                elif c.name in ('chave', '_tag'):
+                    chave = c.value
+            if jsessionid and chave:
+                logger.info(f"   ✓ Login HTTP OK — JSESSIONID: {jsessionid[:20]}...")
+                return {"email": email, "jsessionid": jsessionid, "chave": chave}
+        logger.warning("⚠ Login HTTP falhou (provável reCAPTCHA obrigatório)")
+        return None
+    except Exception as e:
+        logger.warning(f"⚠ Erro login HTTP: {e}")
+        return None
+
+
+# ============================================================================
+# SELENIUM — FALLBACK para login + trial creation
+# ============================================================================
+def find_chrome() -> Optional[str]:
+    """Encontra Chrome/Chromium no sistema."""
+    for name in ("google-chrome", "chrome", "chromium", "chromium-browser"):
+        p = shutil.which(name)
+        if p:
+            return p
+    paths = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        str(SCRIPT_DIR / "chrome-linux" / "chrome"),
+    ]
+    for p in paths:
+        if p and os.path.isfile(p):
+            return p
+    return None
+
+
+def init_selenium(headless: bool = True):
+    """Inicia Chrome via Selenium. Força headless em ambientes sem interface (Colab/Linux sem DISPLAY)."""
+    if not SELENIUM_OK:
+        logger.error("❌ Selenium não instalado. pip install selenium")
+        return None
+    chrome_path = find_chrome()
+    if not chrome_path:
+        logger.error("❌ Chrome não encontrado")
+        return None
+
+    is_colab = 'google.colab' in str(getattr(sys, 'modules', {}))
+    has_display = bool(os.environ.get('DISPLAY'))
+    if is_colab or not has_display:
+        headless = True
+
+    opts = Options()
+    opts.binary_location = chrome_path
+    opts.page_load_strategy = 'eager'
+    for flag in ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
+                 '--disable-blink-features=AutomationControlled',
+                 '--window-size=1280,720',
+                 '--autoplay-policy=no-user-gesture-required']:
+        opts.add_argument(flag)
+    if headless:
+        opts.add_argument('--headless=new')
+    opts.add_experimental_option("prefs", {
+        "profile.managed_default_content_settings.images": 2,
+        "profile.managed_default_content_settings.stylesheets": 2,
+        "profile.managed_default_content_settings.fonts": 2,
+    })
+    try:
+        driver = webdriver.Chrome(options=opts)
+        driver.set_page_load_timeout(120)
+        return driver
+    except Exception as e:
+        logger.error(f"❌ Erro Chrome: {e}")
+        return None
+
+
+def login_selenium(email: str, senha: str, headless: bool = True) -> Optional[dict]:
+    """Login via Selenium (resolve reCAPTCHA v3). Retorna creds ou None."""
+    logger.info(f"🌐 Login via Selenium: {email}")
+    driver = init_selenium(headless=headless)
+    if not driver:
+        return None
+    try:
+        driver.get(LOGIN_URL)
+        time.sleep(3)
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+        try:
+            login_field = WebDriverWait(driver, 15).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR,
+                    "input[name='login'], input[id='login'], input[name='email']")))
+        except Exception:
+            logger.error("❌ Campo de login não encontrado")
+            return None
+        login_field.clear()
+        login_field.send_keys(email)
+        try:
+            senha_field = driver.find_element(By.CSS_SELECTOR,
+                "input[name='senha'], input[id='senha'], input[type='password']")
+            senha_field.clear()
+            senha_field.send_keys(senha)
+        except Exception as e:
+            logger.error(f"❌ Campo senha não encontrado: {e}")
+            return None
+        try:
+            btn = driver.find_element(By.CSS_SELECTOR,
+                "#recaptchav3, #btn-validar-login, button[type=submit]")
+            driver.execute_script("arguments[0].click()", btn)
+        except Exception:
+            senha_field.send_keys(webdriver.Keys.RETURN)
+        try:
+            WebDriverWait(driver, 25).until(
+                lambda d: 'login' not in d.current_url.lower()
+                and 'validar-login' not in d.current_url.lower())
+        except Exception:
+            logger.error("❌ Login falhou (timeout — credenciais inválidas ou reCAPTCHA)")
+            return None
+        cookies_www = driver.get_cookies()
+        driver.get(f"{PORTAL_NEW}/home")
+        time.sleep(2)
+        cookies_portal2025 = driver.get_cookies()
+        all_cookies = {}
+        for c in cookies_www + cookies_portal2025:
+            key = (c.get('name'), c.get('domain'))
+            if key not in all_cookies:
+                all_cookies[key] = c
+        jsessionid = None
+        chave = None
+        for c in all_cookies.values():
+            if c.get('name') == 'JSESSIONID':
+                jsessionid = c.get('value')
+            elif c.get('name') in ('chave', '_tag'):
+                chave = c.get('value')
+        if jsessionid and chave:
+            logger.info(f"   ✓ Login Selenium OK — JSESSIONID: {jsessionid[:20]}...")
+            save_cookies_json(list(all_cookies.values()), email, senha)
+            return {"email": email, "jsessionid": jsessionid, "chave": chave}
+        logger.error("❌ JSESSIONID/chave não encontrados nos cookies")
+        return None
+    except Exception as e:
+        logger.error(f"❌ Erro login Selenium: {e}")
+        return None
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+
+def criar_conta_selenium(conta: dict, headless: bool = True) -> Optional[dict]:
+    """Cria conta trial via Selenium (resolve reCAPTCHA). Retorna creds ou None."""
+    logger.info("🌐 Criando conta trial via Selenium...")
+    driver = init_selenium(headless=headless)
+    if not driver:
+        return None
+    try:
+        driver.get(TRIAL_REG_URL)
+        time.sleep(3)
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+        fields = {
+            '#nome': conta['nome'],
+            '#email': conta['email'],
+            '#telefoneCelular': conta['telefoneCelular'],
+            '#cpf': conta['cpf'],
+        }
+        for selector, value in fields.items():
+            try:
+                el = driver.find_element(By.CSS_SELECTOR, selector)
+                el.clear()
+                el.send_keys(value)
+            except Exception:
+                pass
+        for sel in ["input[name='senha']", "input[id='senha']"]:
+            try:
+                el = driver.find_element(By.CSS_SELECTOR, sel)
+                el.clear()
+                el.send_keys(conta['senha'])
+                break
+            except Exception:
+                pass
+        for sel in ["input[name='senha2']", "input[id='senha2']"]:
+            try:
+                el = driver.find_element(By.CSS_SELECTOR, sel)
+                el.clear()
+                el.send_keys(conta['senha2'])
+                break
+            except Exception:
+                pass
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, '#dataNascimento')
+            el.clear()
+            el.send_keys(conta['dataNascimento'])
+        except Exception:
+            pass
+        try:
+            btn = driver.find_element(By.CSS_SELECTOR, '#btn-gratuito, button[type=submit]')
+            driver.execute_script("arguments[0].click()", btn)
+        except Exception:
+            pass
+        try:
+            def conta_criada(d):
+                url = d.current_url.lower()
+                src = d.page_source or ''
+                title = d.title or ''
+                if 'teste-assinatura' in url:
+                    return False
+                if 'obrigado' in title.lower() or 'obrigado' in url:
+                    return True
+                if 'número do pedido' in src[:10000].lower() or 'numero do pedido' in src[:10000].lower():
+                    return True
+                if '/portal/' in url or '/minhas-compras' in url or '/home' in url:
+                    return True
+                if 'olá' in src[:5000].lower() and '[sair]' in src[:5000].lower():
+                    return True
+                return False
+            WebDriverWait(driver, 90, poll_frequency=2).until(conta_criada)
+            logger.info("   ✓ Conta criada! (página de sucesso detectada)")
+        except Exception as timeout_e:
+            logger.warning("⚠ Timeout no cadastro — mas a conta foi criada.")
+            try:
+                current_url = driver.current_url
+                logger.info(f"   📍 URL atual: {current_url[:80]}")
+            except Exception:
+                pass
+
+            logger.info("🔑 Fazendo login pra capturar JSESSIONID + chave...")
+            try:
+                driver.get(LOGIN_URL)
+                time.sleep(3)
+                try:
+                    login_field = driver.find_element(By.CSS_SELECTOR,
+                        "input[name='login'], input[id='login'], input[name='email']")
+                    login_field.clear()
+                    login_field.send_keys(conta['email'])
+                except Exception:
+                    logger.error("   ❌ Campo de login não encontrado")
+                    return {"email": conta['email'], "jsessionid": "", "chave": ""}
+                try:
+                    senha_field = driver.find_element(By.CSS_SELECTOR,
+                        "input[name='senha'], input[id='senha'], input[type='password']")
+                    senha_field.clear()
+                    senha_field.send_keys(conta['senha'])
+                except Exception:
+                    logger.error("   ❌ Campo senha não encontrado")
+                    return {"email": conta['email'], "jsessionid": "", "chave": ""}
+                try:
+                    btn = driver.find_element(By.CSS_SELECTOR,
+                        "#recaptchav3, #btn-validar-login, button[type=submit]")
+                    driver.execute_script("arguments[0].click()", btn)
+                except Exception:
+                    senha_field.send_keys(webdriver.Keys.RETURN)
+                try:
+                    WebDriverWait(driver, 25).until(
+                        lambda d: 'login' not in d.current_url.lower()
+                        and 'validar-login' not in d.current_url.lower())
+                    logger.info("   ✓ Login OK!")
+                except Exception:
+                    logger.warning("   ⚠ Login timeout — tentando capturar cookies mesmo assim")
+            except Exception as e:
+                logger.warning(f"   ⚠ Erro no login pós-cadastro: {e}")
+
+            try:
+                cookies_www = driver.get_cookies()
+                logger.info(f"   🍪 {len(cookies_www)} cookies de www")
+            except Exception:
+                cookies_www = []
+
+            try:
+                driver.get(f"{PORTAL_NEW}/home")
+                time.sleep(3)
+                cookies_p2025 = driver.get_cookies()
+                logger.info(f"   🍪 {len(cookies_p2025)} cookies de portal2025")
+            except Exception:
+                cookies_p2025 = []
+
+            all_cookies = {}
+            for c in cookies_www + cookies_p2025:
+                key = (c.get('name'), c.get('domain'))
+                if key not in all_cookies:
+                    all_cookies[key] = c
+            for c in all_cookies.values():
+                logger.info(f"      • {c.get('name')}: {str(c.get('value', ''))[:30]}... (domain={c.get('domain')})")
+
+            jsessionid = None
+            chave = None
+            for c in all_cookies.values():
+                if c.get('name') == 'JSESSIONID':
+                    jsessionid = c.get('value')
+                elif c.get('name') in ('chave', '_tag'):
+                    chave = c.get('value')
+
+            if jsessionid and chave:
+                save_cookies_json(list(all_cookies.values()), conta['email'], conta['senha'])
+                logger.info(f"   ✓ Cookies completos — JSESSIONID: {jsessionid[:20]}... | chave: {chave[:20]}...")
+                return {"email": conta['email'], "jsessionid": jsessionid, "chave": chave}
+            elif jsessionid:
+                logger.warning(f"   ⚠ JSESSIONID OK mas sem chave — usando só JSESSIONID")
+                save_cookies_json(list(all_cookies.values()), conta['email'], conta['senha'])
+                return {"email": conta['email'], "jsessionid": jsessionid, "chave": ""}
+
+            logger.warning("   ⚠ Sem JSESSIONID/chave — retornando vazio")
+            return {"email": conta['email'], "jsessionid": "", "chave": ""}
+
+        # 2. Conta criada JÁ LOGADA — captura cookies direto
+        logger.info("   📦 Capturando cookies (conta já está logada)...")
+        cookies_www = driver.get_cookies()
+        driver.get(f"{PORTAL_NEW}/home")
+        time.sleep(2)
+        cookies_p2025 = driver.get_cookies()
+        all_cookies = {}
+        for c in cookies_www + cookies_p2025:
+            key = (c.get('name'), c.get('domain'))
+            if key not in all_cookies:
+                all_cookies[key] = c
+        jsessionid = None
+        chave = None
+        for c in all_cookies.values():
+            if c.get('name') == 'JSESSIONID':
+                jsessionid = c.get('value')
+            elif c.get('name') in ('chave', '_tag'):
+                chave = c.get('value')
+        if jsessionid and chave:
+            save_cookies_json(list(all_cookies.values()), conta['email'], conta['senha'])
+            logger.info(f"   ✓ Cookies capturados — JSESSIONID: {jsessionid[:20]}...")
+            return {"email": conta['email'], "jsessionid": jsessionid, "chave": chave}
+        logger.error("❌ JSESSIONID/chave não encontrados nos cookies")
+        return None
+    except Exception as e:
+        logger.error(f"❌ Erro Selenium: {e}")
+        return None
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+
+# ============================================================================
+# COOKIES — salvar/carregar JSON
+# ============================================================================
+def save_cookies_json(cookies_list, email, password):
+    """Salva cookies em cookies_papa.json."""
+    COOKIES_DIR.mkdir(parents=True, exist_ok=True)
+    data = {
+        'email': email,
+        'password': password,
+        'saved_at': datetime.now().isoformat(),
+        'user_agent': USER_AGENT,
+        'cookies': cookies_list,
+    }
+    try:
+        COOKIES_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False),
+                                encoding='utf-8')
+        logger.info(f"🍪 Cookies salvos: {COOKIES_FILE}")
+    except Exception as e:
+        logger.warning(f"⚠ Erro ao salvar cookies: {e}")
+
+
+def load_cookies_json() -> Optional[dict]:
+    """Carrega cookies_papa.json. Retorna creds (com password) ou None."""
+    if not COOKIES_FILE.exists():
+        return None
+    try:
+        data = json.loads(COOKIES_FILE.read_text(encoding='utf-8'))
+        jsessionid = None
+        chave = None
+        email = data.get('email') or ''
+        password = data.get('password') or ''
+        for c in data.get('cookies', []):
+            if c.get('name') == 'JSESSIONID':
+                jsessionid = c.get('value')
+            elif c.get('name') in ('chave', '_tag'):
+                chave = c.get('value')
+            elif c.get('name') == 'email' and not email:
+                email = c.get('value')
+        if jsessionid and chave:
+            return {"email": email, "jsessionid": jsessionid, "chave": chave,
+                    "password": password}
+    except Exception as e:
+        logger.warning(f"⚠ Erro ao carregar cookies: {e}")
+    return None
+
+
+# ============================================================================
+# ORQUESTRAÇÃO DE CREDENCIAIS
+# ============================================================================
+def get_credentials(force_recreate: bool = False) -> dict:
+    """Obtém credenciais. Ordem: cookies_papa.json → hardcoded → criar nova."""
+    global HARDCODED_EMAIL, HARDCODED_JSESSIONID, HARDCODED_CHAVE
+
+    if force_recreate:
+        return create_new_trial_account()
+
+    saved = load_cookies_json()
+    if saved and saved.get('jsessionid') and saved.get('chave'):
+        logger.info(f"🍪 Usando conta salva: {saved['email']}")
+        return saved
+
+    if HARDCODED_JSESSIONID and HARDCODED_CHAVE:
+        logger.info(f"🔑 Usando hardcoded: {HARDCODED_EMAIL}")
+        return {"email": HARDCODED_EMAIL, "jsessionid": HARDCODED_JSESSIONID,
+                "chave": HARDCODED_CHAVE}
+
+    return create_new_trial_account()
+
+
+def create_new_trial_account() -> dict:
+    """Cria nova conta: 4devs → HTTP POST → Selenium fallback."""
+    logger.info("🤖 Criando nova conta trial...")
+    pessoa = gerar_pessoa_4devs()
+    if not pessoa:
+        logger.error("❌ 4devs falhou")
+        return {}
+    conta = montar_conta(pessoa)
+    if not conta:
+        return {}
+
+    if criar_conta_http(conta):
+        creds = login_http(conta['email'], conta['senha'])
+        if creds:
+            logger.info("✅ Conta criada + login via HTTP!")
+            _update_hardcoded(creds)
+            return creds
+
+    logger.info("🌐 HTTP falhou — tentando Selenium...")
+    is_colab = 'google.colab' in str(getattr(sys, 'modules', {}))
+    has_display = bool(os.environ.get('DISPLAY'))
+    creds = criar_conta_selenium(conta, headless=(is_colab or not has_display))
+    if creds:
+        logger.info("✅ Conta criada + login via Selenium!")
+        _update_hardcoded(creds)
+        return creds
+
+    logger.error("❌ Não consegui criar conta nem logar")
+    return {}
+
+
+def _update_hardcoded(creds: dict):
+    """Atualiza variáveis globais com novas credenciais."""
+    global HARDCODED_EMAIL, HARDCODED_JSESSIONID, HARDCODED_CHAVE
+    HARDCODED_EMAIL = creds.get('email', HARDCODED_EMAIL)
+    HARDCODED_JSESSIONID = creds.get('jsessionid', HARDCODED_JSESSIONID)
+    HARDCODED_CHAVE = creds.get('chave', HARDCODED_CHAVE)
+    logger.info("💡 Atualize hardcoded no topo do script:")
+    logger.info(f"   HARDCODED_EMAIL = \"{HARDCODED_EMAIL}\"")
+    logger.info(f"   HARDCODED_JSESSIONID = \"{HARDCODED_JSESSIONID}\"")
+    logger.info(f"   HARDCODED_CHAVE = \"{HARDCODED_CHAVE}\"")
+
+
+# ============================================================================
+# DESCOBERTA DE CURSOS (dinâmica — sem hardcode)
+# Usa getCursosPacote com listaAlunoCurso
+# ============================================================================
+def discover_courses(session) -> list:
+    """Descobre cursos. Baseado no HAR (esaaraujo-lab/scrapper):
+
+    FLUXO:
+    1. GET www.papaconcursos.com.br/portal/cursos → acha o PRODUTO (assinatura)
+       → <a href="/portal/curso/produto/{TOKEN}/{SLUG}">
+    2. GET /portal/getCursosPacote?format=json&token={PRODUTO_TOKEN}
+       → JSON com os CURSOS REAIS dentro da assinatura
+       (chave: listaAlunoCurso)
+    3. Fallback: portal2025/meus-cursos
+    4. Fallback: portal2025/home
+    """
+    products = []
+    courses = []
+
+    # 1. GET /portal/cursos (www — página de listagem de produtos/assinaturas)
+    logger.info(f"📋 Buscando produtos em {CURSOS_URL}...")
+    try:
+        resp = session.get(CURSOS_URL, timeout=15, verify=False)
+        if resp.status_code == 200 and '<title>Login' not in resp.text[:500]:
+            if BS4_OK:
+                soup = BeautifulSoup(resp.content, 'html.parser')
+                for a in soup.find_all('a', href=True):
+                    href = a['href']
+                    title = a.get('title', '') or a.get_text(strip=True).split('\n')[0]
+                    if not title:
+                        continue
+                    m = re.search(r'/portal/curso/produto/([a-f0-9]{32})/([a-zA-Z0-9_-]+)', href)
+                    if m:
+                        pid = m.group(1)
+                        pslug = m.group(2)
+                        if not any(p['id'] == pid for p in products):
+                            products.append({'id': pid, 'slug': pslug, 'title': title[:80]})
+            else:
+                for m in re.finditer(r'/portal/curso/produto/([a-f0-9]{32})/([a-zA-Z0-9_-]+)', resp.text):
+                    pid, pslug = m.group(1), m.group(2)
+                    if not any(p['id'] == pid for p in products):
+                        products.append({'id': pid, 'slug': pslug, 'title': pslug[:80]})
+        elif resp.status_code == 200 and '<title>Login' in resp.text[:500]:
+            logger.error("❌ Sessão expirada (redirecionado pra login)")
+        else:
+            logger.warning(f"   /portal/cursos HTTP {resp.status_code}")
+    except Exception as e:
+        logger.warning(f"   /portal/cursos erro: {e}")
+
+    logger.info(f"   ✓ {len(products)} produto(s)/assinatura(s) encontrados")
+    for p in products:
+        logger.info(f"     📦 {p['title']} (token={p['id'][:12]}... | {p['slug']})")
+
+    # 2. Para cada produto, chama getCursosPacote pra expandir os cursos reais
+    for prod in products:
+        token = prod['id']
+        slug = prod.get('slug', '')
+        logger.info(f"   🔍 Expandindo cursos de: {prod['title'][:50]}...")
+        course_page_url = f"{PORTAL_NEW}/curso/produto/{token}/{slug}"
+        ajax_headers = {
+            **HEADERS,
+            'Referer': course_page_url,
+            'Accept': 'application/json, text/javascript, */*; q=0.01',
+            'sec-fetch-dest': 'empty',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-site': 'same-origin',
+        }
+        for pagina in range(1, 6):
+            try:
+                resp = session.get(
+                    f"{PORTAL_NEW}/getCursosPacote",
+                    params={'format': 'json', 'token': token,
+                            'palavraChave': '', 'tipo': 'T', 'pagina': pagina},
+                    headers=ajax_headers, timeout=15, verify=False)
+                if resp.status_code != 200:
+                    logger.info(f"   Página {pagina}: HTTP {resp.status_code} — parando")
+                    break
+                text = resp.text
+                if len(text) < 50 or 'login' in text[:500].lower():
+                    logger.info(f"   Página {pagina}: {len(text)} chars (vazio/login) — parando")
+                    break
+                ct = resp.headers.get('content-type', '?')
+                logger.info(f"   Página {pagina}: {len(text)} chars | CT={ct}")
+                if pagina == 1 and len(text) > 100:
+                    logger.info(f"   Preview: {text[:300]}")
+                found_before = len(courses)
+                # Tenta JSON — estrutura real do Papa: {"listaAlunoCurso": [...]}
+                try:
+                    data = resp.json()
+                    if isinstance(data, dict):
+                        for key in ['listaAlunoCurso', 'cursos', 'list', 'data', 'items', 'result']:
+                            if key in data and isinstance(data[key], list):
+                                items = data[key]
+                                if items and pagina == 1:
+                                    logger.info(f"   JSON key='{key}', {len(items)} items")
+                                    if isinstance(items[0], dict):
+                                        logger.info(f"   Item keys: {list(items[0].keys())}")
+                                for item in items:
+                                    if isinstance(item, dict):
+                                        cslug = (item.get('link') or item.get('slug')
+                                                 or item.get('nomeUrl') or '')
+                                        cnome = (item.get('nome') or item.get('titulo')
+                                                 or item.get('nomeCurso') or cslug)
+                                        cid = None
+                                        for field in ['id', 'token', 'idCurso', 'hash', 'idProduto']:
+                                            val = str(item.get(field, ''))
+                                            m = re.search(r'([a-f0-9]{32})', val)
+                                            if m:
+                                                cid = m.group(1)
+                                                break
+                                        if not cid:
+                                            tcl = item.get('tipoCursoLink', '')
+                                            m = re.search(r'idProduto[=]([^&\s]+)', tcl)
+                                            if m:
+                                                cid = m.group(1)
+                                        if not cid:
+                                            iam = item.get('idAlunoMensalidade', '')
+                                            if iam:
+                                                cid = str(iam)
+                                        if not cid and cslug:
+                                            cid = cslug
+                                        if cid and cslug:
+                                            if not any(c['id'] == str(cid) for c in courses):
+                                                courses.append({'id': str(cid), 'name': cslug, 'title': cnome[:80]})
+                                break
+                    elif isinstance(data, list):
+                        for item in data:
+                            if isinstance(item, dict):
+                                cslug = item.get('link') or item.get('slug') or ''
+                                cnome = item.get('nome') or item.get('titulo') or cslug
+                                cid = str(item.get('id') or item.get('token')
+                                          or item.get('idAlunoMensalidade') or cslug)
+                                if cslug:
+                                    if not any(c['id'] == cid for c in courses):
+                                        courses.append({'id': cid, 'name': cslug, 'title': cnome[:80]})
+                except Exception:
+                    if BS4_OK and text:
+                        soup = BeautifulSoup(text, 'html.parser')
+                        for a in soup.find_all('a', href=True):
+                            href = a['href']
+                            title = a.get_text(strip=True).split('\n')[0]
+                            m = re.search(r'/portal/curso-aula/produto-pacote/([a-f0-9]{20,})/([a-zA-Z0-9_-]+)', href)
+                            if m and title:
+                                cid = m.group(1)
+                                cslug = m.group(2)
+                                if not any(c['id'] == cid for c in courses):
+                                    courses.append({'id': cid, 'name': cslug, 'title': title[:80]})
+                        for el in soup.find_all(attrs={'onclick': True}):
+                            onclick = el.get('onclick', '')
+                            m = re.search(r"produto[-]pacote?/([a-f0-9]{20,})/([a-zA-Z0-9_-]+)", onclick)
+                            if m:
+                                cid = m.group(1)
+                                cslug = m.group(2)
+                                title = el.get_text(strip=True)[:80] or cslug
+                                if not any(c['id'] == cid for c in courses):
+                                    courses.append({'id': cid, 'name': cslug, 'title': title})
+                    elif not BS4_OK:
+                        for m in re.finditer(r'/portal/curso-aula/produto-pacote/([a-f0-9]{20,})/([a-zA-Z0-9_-]+)', text):
+                            cid, cslug = m.group(1), m.group(2)
+                            if not any(c['id'] == cid for c in courses):
+                                courses.append({'id': cid, 'name': cslug, 'title': cslug[:80]})
+                found_after = len(courses)
+                if found_after == found_before:
+                    logger.info(f"   Página {pagina}: 0 cursos novos — parando")
+                    break
+                logger.info(f"   Página {pagina}: +{found_after - found_before} cursos")
+            except Exception as e:
+                logger.warning(f"   getCursosPacote página {pagina} erro: {e}")
+                break
+
+    # 3. Fallback: portal2025/meus-cursos
+    if not courses:
+        logger.info(f"📋 Tentando {MEUS_CURSOS_URL}...")
+        try:
+            resp = session.get(MEUS_CURSOS_URL, timeout=15, verify=False)
+            if resp.status_code == 200 and '<title>Login' not in resp.text[:500] and BS4_OK:
+                soup = BeautifulSoup(resp.content, 'html.parser')
+                for a in soup.find_all('a', href=True):
+                    href = a['href']
+                    title = a.get_text(strip=True).split('\n')[0]
+                    m = re.search(r'/portal/curso(?:/produto|[-]aula/produto[-]pacote)/([a-f0-9]{20,})/([a-zA-Z0-9_-]+)', href)
+                    if m and title:
+                        cid = m.group(1)
+                        cslug = m.group(2)
+                        if not any(c['id'] == cid for c in courses):
+                            courses.append({'id': cid, 'name': cslug, 'title': title[:80]})
+        except Exception as e:
+            logger.warning(f"   /meus-cursos erro: {e}")
+
+    # 4. Fallback: portal2025/home
+    if not courses:
+        logger.info(f"📋 Tentando {PORTAL_NEW}/home...")
+        try:
+            resp = session.get(f"{PORTAL_NEW}/home", timeout=15, verify=False)
+            if resp.status_code == 200 and '<title>Login' not in resp.text[:500] and BS4_OK:
+                soup = BeautifulSoup(resp.content, 'html.parser')
+                for a in soup.find_all('a', href=True):
+                    href = a['href']
+                    title = a.get_text(strip=True).split('\n')[0]
+                    m = re.search(r'/portal/curso(?:/produto|[-]aula/produto[-]pacote)/([a-f0-9]{20,})/([a-zA-Z0-9_-]+)', href)
+                    if m and title:
+                        cid = m.group(1)
+                        cslug = m.group(2)
+                        if not any(c['id'] == cid for c in courses):
+                            courses.append({'id': cid, 'name': cslug, 'title': title[:80]})
+        except Exception as e:
+            logger.warning(f"   /portal/home erro: {e}")
+
+    if courses:
+        logger.info(f"   ✓ {len(courses)} cursos encontrados")
+        for i, c in enumerate(courses, 1):
+            logger.info(f"     {i}. {c['title']} ({c['id'][:12]}... | {c['name']})")
+    else:
+        logger.error("❌ Nenhum curso encontrado")
+    return courses
+
+
+# ============================================================================
+# HTML → MARKDOWN
+# ============================================================================
+def html_to_markdown(html: str) -> str:
+    """Converte HTML pra Markdown limpo."""
+    if not html:
+        return ""
+    html = html.replace('&nbsp;', ' ').replace('&amp;', '&')
+    html = html.replace('&lt;', '<').replace('&gt;', '>')
+    html = html.replace('&quot;', '"').replace('&#39;', "'")
+    html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.S | re.I)
+    html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.S | re.I)
+    for level in range(1, 7):
+        html = re.sub(rf'<h{level}[^>]*>(.*?)</h{level}>',
+                      f'\n\n{"#" * level} \\1\n\n', html, flags=re.S | re.I)
+    html = re.sub(r'<hr[^>]*>', '\n\n---\n\n', html, flags=re.I)
+    html = re.sub(r'<br\s*/?>', '\n', html, flags=re.I)
+    html = re.sub(r'<p[^>]*>(.*?)</p>', r'\n\n\1\n\n', html, flags=re.S | re.I)
+    html = re.sub(r'<(strong|b)[^>]*>(.*?)</\1>', r'**\2**', html, flags=re.S | re.I)
+    html = re.sub(r'<(em|i)[^>]*>(.*?)</\1>', r'*\2*', html, flags=re.S | re.I)
+    html = re.sub(r'<code[^>]*>(.*?)</code>', r'`\1`', html, flags=re.S | re.I)
+    html = re.sub(r'<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+                  r'[\2](\1)', html, flags=re.S | re.I)
+
+    def convert_ul(m):
+        items = re.findall(r'<li[^>]*>(.*?)</li>', m.group(1), flags=re.S | re.I)
+        return '\n\n' + '\n'.join(f'- {i.strip()}' for i in items) + '\n\n'
+    html = re.sub(r'<ul[^>]*>(.*?)</ul>', convert_ul, html, flags=re.S | re.I)
+
+    def convert_ol(m):
+        items = re.findall(r'<li[^>]*>(.*?)</li>', m.group(1), flags=re.S | re.I)
+        return '\n\n' + '\n'.join(f'{i + 1}. {x.strip()}' for i, x in enumerate(items)) + '\n\n'
+    html = re.sub(r'<ol[^>]*>(.*?)</ol>', convert_ol, html, flags=re.S | re.I)
+
+    html = re.sub(r'<[^>]+>', '', html)
+    html = re.sub(r'\n{3,}', '\n\n', html)
+    html = re.sub(r'[ \t]+\n', '\n', html)
+    return html.strip() + '\n'
+
+
+# ============================================================================
+# AUTH MANAGER (de psantos.py — usa plain requests, sem cloudscraper)
+# ============================================================================
+class AuthManager:
+    """
+    Autenticação dupla:
+      • Modo cookies: JSESSIONID + chave (rápido, mas expira)
+      • Modo Selenium: login via navegador headless (renova cookies)
+    """
+
+    def __init__(self, use_selenium: bool = False,
+                 email: str = None, password: str = None,
+                 jsessionid: str = None, chave: str = None):
+        self.use_selenium = use_selenium or (SELENIUM_OK and bool(email) and bool(password))
+        self.email = email
+        self.password = password
+        self.jsessionid = jsessionid
+        self.chave = chave
+
+        # Plain requests.Session() (NÃO cloudscraper — evita erro SSL em Py 3.10+)
+        self.session = requests.Session()
+        self.session.verify = False
+        self.session.headers.update(HEADERS)
+
+        self.driver = None
+        self.driver_lock = threading.Lock()
+        self.cookies_file = TEMP_DIR / 'netscape_cookies.txt'
+
+    # ---- Login por cookies (set em 3 domínios) ----------------------------
+    def login_cookies(self, email: str, jsessionid: str, chave: str):
+        """Seta cookies em 3 domínios (mais robusto que sem domain)."""
+        set_cookies_on_session(self.session, email, jsessionid, chave)
+        logger.info(f"✓ Sessão iniciada via cookies: {email}")
+
+    # ---- Login via Selenium (de psantos.py) --------------------------------
+    def login_selenium(self) -> bool:
+        if not SELENIUM_OK:
+            logger.error("❌ Selenium não disponível. pip install selenium")
+            return False
+
+        with self.driver_lock:
+            self._init_driver()
+            try:
+                logger.info(f"🔐 Login via Selenium em [{CURRENT_ENV.upper()}]...")
+                self.driver.get(LOGIN_URL)
+                time.sleep(3)
+
+                if 'login' in self.driver.current_url.lower():
+                    try:
+                        email_input = self.driver.find_element(By.NAME, 'login')
+                    except Exception:
+                        try:
+                            email_input = self.driver.find_element(By.NAME, 'email')
+                        except Exception:
+                            email_input = self.driver.find_element(By.ID, 'login')
+                    pass_input = self.driver.find_element(By.CSS_SELECTOR,
+                        "input[name='senha'], input[id='senha'], input[type='password']")
+                    email_input.clear()
+                    email_input.send_keys(self.email)
+                    pass_input.clear()
+                    pass_input.send_keys(self.password)
+                    try:
+                        btn = self.driver.find_element(By.CSS_SELECTOR,
+                            "#recaptchav3, #btn-validar-login, button[type=submit]")
+                        self.driver.execute_script("arguments[0].click()", btn)
+                    except Exception:
+                        from selenium.webdriver.common.keys import Keys
+                        pass_input.send_keys(Keys.RETURN)
+                    time.sleep(5)
+
+                if 'login' in self.driver.current_url.lower():
+                    logger.error("❌ Falha no login Selenium. Verifique credenciais.")
+                    return False
+
+                # Sincroniza User-Agent
+                try:
+                    ua = self.driver.execute_script("return navigator.userAgent;")
+                    self.session.headers.update({'User-Agent': ua, 'Referer': BASE_URL})
+                except Exception:
+                    pass
+
+                # Copia cookies para a requests.Session
+                cookies = self.driver.get_cookies()
+                self._save_netscape_cookies(cookies)
+                for ck in cookies:
+                    try:
+                        self.session.cookies.set(
+                            ck['name'], ck['value'],
+                            domain=ck.get('domain', '') or '.papaconcursos.com.br')
+                    except Exception:
+                        pass
+
+                logger.info("✅ Login Selenium OK e cookies sincronizados.")
+                return True
+            except Exception as e:
+                logger.error(f"❌ Erro login Selenium: {e}")
+                return False
+
+    def _init_driver(self):
+        opts = Options()
+        opts.add_argument('--headless=new')
+        opts.add_argument('--no-sandbox')
+        opts.add_argument('--disable-dev-shm-usage')
+        opts.add_argument('--disable-gpu')
+        opts.add_argument('--window-size=1920,1080')
+        opts.add_argument('--disable-blink-features=AutomationControlled')
+
+        chrome_bin = find_chrome()
+        if chrome_bin:
+            opts.binary_location = chrome_bin
+        try:
+            self.driver = webdriver.Chrome(options=opts)
+        except Exception as e:
+            logger.warning(f"⚠ Selenium Manager falhou ({e}); tentando webdriver-manager...")
+            try:
+                from webdriver_manager.chrome import ChromeDriverManager
+                from selenium.webdriver.chrome.service import Service
+                driver_path = ChromeDriverManager().install()
+                if sys.platform.startswith('win') and not driver_path.lower().endswith('.exe'):
+                    base_dir = (os.path.dirname(driver_path) if os.path.isfile(driver_path)
+                                else driver_path)
+                    for root, _, files in os.walk(base_dir):
+                        for f in files:
+                            if f.lower() == 'chromedriver.exe':
+                                driver_path = os.path.join(root, f)
+                                break
+                self.driver = webdriver.Chrome(service=Service(driver_path), options=opts)
+            except Exception as e2:
+                logger.error(f"❌ webdriver-manager falhou: {e2}")
+                raise
+
+        try:
+            self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+                "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            })
+        except Exception:
+            pass
+
+    def _save_netscape_cookies(self, cookies: list):
+        """Salva cookies em formato Netscape (necessário para yt-dlp)."""
+        try:
+            with open(self.cookies_file, 'w', encoding='utf-8') as f:
+                f.write('# Netscape HTTP Cookie File\n')
+                for c in cookies:
+                    domain = c.get('domain', '') or '.papaconcursos.com.br'
+                    flag = 'TRUE' if domain.startswith('.') else 'FALSE'
+                    path = c.get('path', '/')
+                    secure = 'TRUE' if c.get('secure', False) else 'FALSE'
+                    exp = str(int(c.get('expiry', time.time() + 86400)))
+                    f.write(f"{domain}\t{flag}\t{path}\t{secure}\t{exp}\t{c.get('name')}\t{c.get('value')}\n")
+        except Exception as e:
+            logger.warning(f"⚠ Erro ao salvar Netscape cookies: {e}")
+
+    def ensure_valid_session(self) -> bool:
+        """Verifica/renova sessão."""
+        try:
+            resp = self.session.get(f"{BASE_URL}/portal/api/user/info",
+                                    timeout=10, verify=False, allow_redirects=False)
+            if resp.status_code in (200, 302) and 'login' not in resp.headers.get('Location', '').lower():
+                return True
+        except Exception:
+            pass
+
+        if self.use_selenium and self.email and self.password:
+            logger.warning("⚠ Sessão expirada. Renovando via Selenium...")
+            return self.login_selenium()
+
+        logger.error("❌ Sessão expirada. Renove os cookies manualmente.")
+        return False
+
+    def close(self):
+        with self.driver_lock:
+            if self.driver:
+                try:
+                    self.driver.quit()
+                except Exception:
+                    pass
+                self.driver = None
+
+
+# ============================================================================
+# COLETOR DE LINKS — DETECÇÃO DUPLA + FALLBACK PLAYER ANTIGO (.mpd → .m3u8)
+# ============================================================================
+class LinkCollector:
+    def __init__(self, session: requests.Session, auth: AuthManager = None):
+        self.session = session
+        self.auth = auth
+
+    # ---- Entrada ----------------------------------------------------------
+    def collect_all_links(self, course_id: str, course_name: str,
+                          force_rebuild: bool = False) -> Dict:
+        cache_file = CACHE_DIR / f"{course_id}_links.json"
+        if cache_file.exists():
+            if force_rebuild:
+                logger.warning(f"force_rebuild=True — descartando cache: {course_name}")
+                cache_file.unlink()
+            else:
+                try:
+                    cached = json.loads(cache_file.read_text(encoding='utf-8'))
+                    if cached:
+                        logger.info(f"📦 Cache: {course_name} ({len(cached)} aulas)")
+                        return cached
+                except Exception:
+                    cache_file.unlink()
+
+        logger.info(f"🔍 Coletando links: {course_name}")
+        root_items = self._get_root_items(course_id, course_name)
+
+        if not root_items:
+            raise RuntimeError(
+                f"Sessão expirada ou course_id/name incorreto: '{course_name}'. "
+                f"Renove os cookies/Selenium."
+            )
+
+        all_links: Dict = {}
+        for item_name, item_token in root_items.items():
+            self._recurse(item_token, course_id, clear_name(item_name), all_links)
+
+        if not all_links:
+            raise RuntimeError(f"Nenhuma aula coletada para '{course_name}'.")
+
+        try:
+            cache_file.write_text(
+                json.dumps(all_links, ensure_ascii=False, indent=2),
+                encoding='utf-8')
+            logger.info(f"💾 Cache salvo: {len(all_links)} aulas")
+        except Exception as e:
+            logger.warning(f"⚠ Erro ao salvar cache: {e}")
+        return all_links
+
+    # ---- Detecta root items (duas estratégias) ----------------------------
+    def _get_root_items(self, course_id: str, course_name: str) -> Dict[str, str]:
+        url = f"{PORTAL_NEW}/curso-aula/produto-pacote/{course_id}/{course_name}"
+        resp = self.session.get(url, headers=HEADERS, timeout=TIMEOUT, verify=False)
+        resp.raise_for_status()
+
+        # Detecção inteligente de encoding
+        if not resp.encoding or resp.encoding.lower() == 'iso-8859-1':
+            if CHARSET_NORMALIZER_OK:
+                try:
+                    detected = _from_bytes(resp.content).best()
+                    resp.encoding = str(detected.encoding) if detected else 'utf-8'
+                except Exception:
+                    resp.encoding = 'utf-8'
+            else:
+                resp.encoding = 'utf-8'
+
+        html = safe_decode(resp.content, resp.encoding or 'utf-8')
+        html = normalize_text(html)
+
+        if '<title>Login' in html[:500]:
+            raise RuntimeError(
+                "SESSÃO EXPIRADA — cookies inválidos ou vencidos! "
+                "Renove JSESSIONID/chave ou use Selenium."
+            )
+
+        soup = BeautifulSoup(html, 'html.parser')
+        items: Dict[str, str] = {}
+
+        # Estratégia 1: layout novo (header-wrapper primary)
+        for div in soup.find_all('div', class_=lambda c: c and 'header-wrapper' in c and 'primary' in c):
+            target = div.get('data-target', '')
+            m = re.search(r'#(item-[a-f0-9]+-[a-f0-9]+)$', target)
+            if not m:
+                continue
+            token = m.group(1)
+            h3 = div.find('h3')
+            if not h3:
+                continue
+            for badge in h3.find_all('span', class_='badge'):
+                badge.decompose()
+            name = normalize_text(h3.get_text(strip=True))
+            if name:
+                items[clear_name(name)] = token
+
+        # Estratégia 2: layout antigo (item-tree)
+        if not items:
+            for li in soup.find_all('li', class_=lambda c: c and 'item-tree' in c):
+                text = li.get_text(strip=True).split('Disponível')[0].strip()
+                onclick = li.get('onclick', '')
+                parts = onclick.split("'")
+                token = parts[1] if len(parts) > 1 else None
+                if token:
+                    items[clear_name(normalize_text(text))] = token
+
+        logger.info(f"  Itens raiz: {len(items)} — {list(items.keys())[:5]}")
+        return items
+
+    # ---- Recursão (token dinâmico do v3/v4) ------------------------------
+    def _recurse(self, token: str, course_id: str, path: str, all_links: Dict):
+        logger.info(f"📂 Explorando: {path}")
+        try:
+            data = self._get_topico(token)
+        except Exception as e:
+            logger.warning(f"  ⚠ Erro getTopico ({token}): {e}")
+            return
+
+        parent_token = data.get('token', token)
+
+        # Sub-tópicos intermediários
+        for sub in data.get('listTopics', []):
+            sub_token = f"{parent_token}-{sub['token']}"
+            sub_name = normalize_text(sub.get('nome', ''))
+            self._recurse(sub_token, course_id,
+                          f"{path}/{clear_name(sub_name)}", all_links)
+
+        # Aulas com mídia
+        for item in data.get('listTopicsMedia', []):
+            self._process_media_item(item, parent_token, course_id, path, all_links)
+
+    def _process_media_item(self, item: dict, parent_token: str,
+                            course_id: str, path: str, all_links: Dict):
+        titulo = normalize_text(item.get('titulo', 'sem-titulo'))
+        item_title = clear_name(titulo)
+        media_token = f"{parent_token}-{item['token']}"
+
+        # idVideo para geração IA
+        id_video = None
+        video_to = item.get('videoTO') or {}
+        if video_to:
+            id_video = video_to.get('param') or video_to.get('id')
+
+        video_url = self._get_video_url(media_token, titulo)
+        materials = self._get_materials(item['token'], course_id)
+
+        lesson_key = f"{path}/{item_title}"
+        all_links[lesson_key] = {
+            'video': video_url,
+            'materials': materials,
+            'id_video': id_video,
+        }
+        tipos = [m.get('tipo', '?') for m in materials]
+        logger.info(f"  ✓ {lesson_key} | vídeo={'✓' if video_url else '✗'} | "
+                    f"{len(materials)} mat {tipos}")
+
+    # ---- Busca de URL de vídeo (.mpd → .m3u8 via fallback player antigo) -
+    def _get_video_url(self, media_token: str, titulo: str) -> Optional[str]:
+        try:
+            resp = self.session.get(
+                f"{PORTAL_NEW}/media",
+                params={'token': media_token}, headers=HEADERS,
+                timeout=TIMEOUT, verify=False
+            )
+            resp.raise_for_status()
+        except Exception as e:
+            logger.debug(f"    ⚠ Erro media ({titulo}): {e}")
+            return None
+
+        text = safe_decode(resp.content, resp.encoding or 'utf-8')
+        text = normalize_text(text)
+        soup = BeautifulSoup(text, 'html.parser')
+
+        # 1) master.m3u8 direto no HTML
+        m = re.search(r'(https?://[^\s\'"<>]+/master\.m3u8[^\s\'"<>]*)', text)
+        if m:
+            return m.group(1)
+
+        # 2) .m3u8 genérico
+        m = re.search(r'(https?://[^\s\'"<>]+\.m3u8[^\s\'"<>]*)', text)
+        if m:
+            return m.group(1)
+
+        # 3) iframes da videotecaead (com fallback player antigo via slug)
+        VIDEO_DOMAINS = ('videotecaead.com.br', 'embed.videotecaead.com.br',
+                         'player.videotecaead.com.br')
+        candidate_iframes = [
+            f for f in soup.find_all('iframe')
+            if any(d in (f.get('src') or '') for d in VIDEO_DOMAINS)
+        ]
+
+        for iframe in candidate_iframes:
+            iframe_src = (iframe.get('src') or '').strip()
+            if not iframe_src:
+                continue
+            try:
+                vid_resp = self.session.get(iframe_src, headers=HEADERS,
+                                            timeout=TIMEOUT, verify=False)
+                vid_text = safe_decode(vid_resp.content, vid_resp.encoding or 'utf-8')
+
+                # 3a) m3u8 em <script>
+                for script in BeautifulSoup(vid_text, 'html.parser').find_all('script'):
+                    mo = re.search(r'(https?://[^\s\'"<>]+\.m3u8[^\s\'"<>]*)',
+                                   script.string or '')
+                    if mo:
+                        return mo.group(1)
+
+                # 3b) m3u8 no texto
+                mo = re.search(r'(https?://[^\s\'"<>]+\.m3u8[^\s\'"<>]*)', vid_text)
+                if mo:
+                    return mo.group(1)
+
+                # 3c) Player DRM (.mpd) -> tenta player antigo via slug
+                #     (fallback que FUNCIONA sem DRM — embed.videotecaead.com.br/papaconcursos/{SLUG})
+                mpd_m = re.search(
+                    r"const\s+manifestUrl\s*=\s*'(https?://[^']+\.mpd[^']*)'", vid_text
+                )
+                if mpd_m:
+                    mpd_url = mpd_m.group(1)
+                    title_m = re.search(r'<title>([^<]+)</title>', vid_text)
+                    if title_m:
+                        raw_title = title_m.group(1).replace('.mp4', '').strip()
+                        slug = self._title_to_slug(raw_title)
+                        old_url = f"https://embed.videotecaead.com.br/papaconcursos/{slug}"
+                        try:
+                            old_resp = self.session.get(old_url, headers=HEADERS,
+                                                         timeout=TIMEOUT, verify=False)
+                            if old_resp.status_code == 200:
+                                for script in BeautifulSoup(old_resp.content, 'html.parser').find_all('script'):
+                                    mo = re.search(r'(https?://[^\s\'"<>]+\.m3u8[^\s\'"<>]*)',
+                                                   script.string or '')
+                                    if mo:
+                                        logger.info(f"  ✓ m3u8 via player antigo: {mo.group(1)[:80]}")
+                                        return mo.group(1)
+                                mo = re.search(r'(https?://[^\s\'"<>]+\.m3u8[^\s\'"<>]*)',
+                                               old_resp.text)
+                                if mo:
+                                    return mo.group(1)
+                        except Exception:
+                            pass
+                    # Último recurso: .mpd mesmo (yt-dlp vai tentar baixar)
+                    logger.warning(f"  ⚠ Usando .mpd (sem fallback): {mpd_url[:80]}")
+                    return mpd_url
+            except Exception as e:
+                logger.debug(f"    ⚠ Erro iframe {iframe_src[:60]}: {e}")
+
+        return None
+
+    @staticmethod
+    def _title_to_slug(title: str) -> str:
+        """Converte título em slug do player antigo (de ISOLADAS 2026.py).
+
+        Ex: 'Direito Civil - Aula 01.mp4' -> 'DIREITO_CIVIL_AULA_01'
+        """
+        nfkd = unicodedata.normalize('NFKD', title)
+        ascii_str = nfkd.encode('ASCII', 'ignore').decode('ASCII').upper()
+        clean = re.sub(r'[^A-Z0-9\s\-]', '', ascii_str)
+        parts = [p.strip() for p in clean.split('-') if p.strip()]
+        return '-'.join(p.replace(' ', '_') for p in parts)
+
+    # ---- Materiais via getDocumentoTopico -------------------------------
+    def _get_materials(self, topico_token: str, course_id: str) -> List[Dict]:
+        materials = []
+        try:
+            resp = self.session.get(
+                f"{PORTAL_NEW}/getDocumentoTopico",
+                params={
+                    'format': 'json',
+                    'token': topico_token,
+                    'tokenCurso': course_id,
+                    'flagAI': '0-1-1-1-1-1-1-1-1-1-1-1-1-1-1-',
+                    'flagTranscricao': '1',
+                },
+                headers=HEADERS, timeout=TIMEOUT, verify=False
+            )
+            resp.raise_for_status()
+            docs = resp.json()
+            if not docs:
+                return []
+
+            for doc in docs:
+                tipo = doc.get('tipo', '')
+                token = doc.get('token')
+                nome = clear_name(normalize_text(doc.get('nome', tipo)))
+
+                # Documentos (D, L)
+                if tipo in ('D', 'L') and token:
+                    url = (f"{PORTAL_NEW}/documento-online-key"
+                           f"?idDocumento={token}&tipo=D&token={course_id}")
+                    materials.append({'url': url, 'nome': nome, 'tipo': tipo})
+
+                # Transcrições/ebooks IA já gerados (T, A-1, A-3)
+                elif tipo in ('T', 'A-1', 'A-3') and token and token not in ('A-1', 'A-3'):
+                    url = f"{PORTAL_NEW}/getTranscricao?token={token}&format=json"
+                    materials.append({'url': url, 'nome': nome or tipo, 'tipo': tipo})
+        except Exception as e:
+            logger.debug(f"    ⚠ Erro getDocumentoTopico ({topico_token}): {e}")
+        return materials
+
+    # ---- getTopico com POST ----------------------------------------------
+    def _get_topico(self, token: str) -> Dict:
+        resp = self.session.post(
+            f"{PORTAL_NEW}/getTopico",
+            data={'token': token}, headers=HEADERS, timeout=TIMEOUT, verify=False
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+# ============================================================================
+# GERADOR DE E-BOOK IA (Markdown) — de psantos.py
+# ============================================================================
+class EbookAiGenerator:
+    @staticmethod
+    def generate_ebook(lesson_dir: Path, lesson_name: str,
+                       ai_data: Dict[str, str]):
+        if not any(ai_data.values()):
+            return
+        ebook_file = lesson_dir / f"Ebook_IA_{clear_name(lesson_name)}.md"
+        content = [
+            f"# E-BOOK COMPLETO DA AULA: {lesson_name}\n",
+            f"*Gerado em {time.strftime('%d/%m/%Y %H:%M:%S')}*\n",
+            "---\n",
+        ]
+        if ai_data.get('summary'):
+            content += ["## 📝 RESUMO DA AULA\n", f"{ai_data['summary']}\n\n---\n"]
+        if ai_data.get('flashcards'):
+            content += ["## 🎴 FLASHCARDS DE REVISÃO\n", f"{ai_data['flashcards']}\n\n---\n"]
+        if ai_data.get('mindmap'):
+            content += ["## 🧠 MAPA MENTAL\n", f"{ai_data['mindmap']}\n\n---\n"]
+        if ai_data.get('transcription'):
+            content += ["## 🎙️ TRANSCRIÇÃO COMPLETA\n", f"{ai_data['transcription']}\n"]
+        try:
+            ebook_file.write_text('\n'.join(content), encoding='utf-8')
+            logger.info(f"📘 E-book gerado: {ebook_file.name}")
+        except Exception as e:
+            logger.warning(f"⚠ Erro ao gerar e-book: {e}")
+
+
+# ============================================================================
+# PAPA DOWNLOADER (do psantos.py — SEM DRM, com fallback .mpd→.m3u8)
+# ============================================================================
+class PapaDownloader:
+    """
+    Downloader principal.
+    NÃO USA DRM (KeyosResolver removido — fallback .mpd→.m3u8 via embed.videotecaead
+    funciona sem necessidade de chaves Widevine).
+    """
+
+    def __init__(self, auth: AuthManager):
+        self.auth = auth
+        self.session = auth.session
+        self.cookies_file = auth.cookies_file
+        self.ebook_gen = EbookAiGenerator()
+        self.generate_ai = False  # habilitar via flag
+
+    # ---- Loop principal de curso ------------------------------------------
+    def download_course(self, course_id: str, course_name: str,
+                        force_rebuild: bool = False):
+        collector = LinkCollector(self.session, self.auth)
+        all_links = collector.collect_all_links(course_id, course_name, force_rebuild)
+
+        course_dir = create_folder(str(BASE_DIR / clear_name(course_name)))
+
+        video_tasks: List[Tuple[str, str, str]] = []  # (url, output, lesson_key)
+        pdf_tasks: List[Tuple[str, str]] = []
+        ai_pending: List[Dict] = []
+
+        # Organiza downloads
+        for lesson_name, lesson_data in all_links.items():
+            lesson_dir = create_folder(os.path.join(course_dir, lesson_name))
+
+            # Vídeo
+            if lesson_data.get('video'):
+                video_file = os.path.join(lesson_dir, '001 - aula.mp4')
+                if not is_video_complete(video_file):
+                    video_tasks.append((lesson_data['video'], video_file, lesson_name))
+                else:
+                    logger.info(f"Vídeo já existe: {lesson_name}")
+
+            # Materiais estáticos
+            mat_idx = 1
+            for mat in lesson_data.get('materials', []):
+                url = mat.get('url', '')
+                nome = mat.get('nome', 'material')
+                mat_dir = create_folder(os.path.join(lesson_dir, 'material'))
+                mat_file = os.path.join(mat_dir, f"{mat_idx:03d} - {nome}.pdf")
+                mat_idx += 1
+                if is_valid_pdf(mat_file):
+                    continue
+                if os.path.exists(mat_file):
+                    os.remove(mat_file)
+                if url:
+                    pdf_tasks.append((url, mat_file))
+
+            # Registro para geração IA (se habilitado)
+            id_video = lesson_data.get('id_video')
+            if id_video and self.generate_ai:
+                tipos_existentes = {m.get('tipo') for m in lesson_data.get('materials', [])}
+                needs_transcricao = 'T' not in tipos_existentes
+                needs_ebook = 'A-3' not in tipos_existentes
+                if needs_transcricao or needs_ebook:
+                    ai_pending.append({
+                        'id_video': id_video,
+                        'lesson_dir': lesson_dir,
+                        'lesson_name': lesson_name,
+                        'mat_idx': mat_idx,
+                        'needs_transcricao': needs_transcricao,
+                        'needs_ebook': needs_ebook,
+                        'token_transcricao': None,
+                        'token_ebook': None,
+                    })
+
+        logger.info(f"\n⬇️  {course_name}: "
+                    f"{len(video_tasks)} vídeos | {len(pdf_tasks)} PDFs | "
+                    f"{len(ai_pending)} IA pendentes")
+
+        # 1) Dispara geração IA em background
+        if ai_pending:
+            logger.info(f"⚙ Disparando geração IA para {len(ai_pending)} aulas...")
+            threading.Thread(target=self._fire_ai_generation,
+                             args=(ai_pending,), daemon=True).start()
+
+        # 2) PDFs estáticos em paralelo
+        if pdf_tasks:
+            with ThreadPoolExecutor(max_workers=MAX_PDF_WORKERS) as pool:
+                futures = {pool.submit(self._download_pdf, u, p): p for u, p in pdf_tasks}
+                for f in as_completed(futures):
+                    try:
+                        f.result()
+                    except Exception as e:
+                        logger.debug(f"  PDF error: {e}")
+                    time.sleep(BATCH_DELAY)
+
+        # 3) Vídeos em paralelo (com polling IA opcional)
+        if video_tasks:
+            poll_stop = None
+            poll_thread = None
+            if ai_pending:
+                poll_stop = threading.Event()
+                poll_thread = threading.Thread(
+                    target=self._ai_poll_loop, args=(ai_pending, poll_stop), daemon=True
+                )
+                poll_thread.start()
+
+            with ThreadPoolExecutor(max_workers=MAX_VIDEO_WORKERS) as pool:
+                futures = [pool.submit(self._download_video, u, p, k)
+                           for u, p, k in video_tasks]
+                for f in as_completed(futures):
+                    try:
+                        f.result()
+                    except Exception as e:
+                        logger.debug(f"  Vídeo error: {e}")
+
+            if poll_stop:
+                poll_stop.set()
+                if poll_thread:
+                    poll_thread.join(timeout=10)
+
+        # 4) Varredura final IA
+        if ai_pending:
+            logger.info("🔄 Varredura final de materiais IA...")
+            self._poll_and_download_ai(ai_pending)
+
+        logger.info(f"✅ Curso concluído: {course_name}")
+
+    # ---- Geração IA ------------------------------------------------------
+    def _fire_ai_generation(self, ai_pending: List[dict]):
+        for entry in ai_pending:
+            if entry.get('needs_transcricao'):
+                tok = self._call_gerar_ai('transcricao', entry['id_video'])
+                if tok:
+                    entry['token_transcricao'] = tok
+            if entry.get('needs_ebook'):
+                tok = self._call_gerar_ai('ebook', entry['id_video'])
+                if tok:
+                    entry['token_ebook'] = tok
+            time.sleep(0.5)
+
+    def _call_gerar_ai(self, tipo: str, id_video: str) -> Optional[str]:
+        endpoint = {
+            'transcricao': f"{PORTAL_NEW}/gerarAITranscricao",
+            'ebook':       f"{PORTAL_NEW}/gerarAIEbook",
+        }[tipo]
+        try:
+            resp = self.session.post(endpoint, data={'idVideo': id_video},
+                                     headers=HEADERS, timeout=180, verify=False)
+            resp.raise_for_status()
+            data = resp.json()
+            tok = data.get('token')
+            if tok:
+                logger.debug(f"  ⚙ {tipo} disparado id={id_video} → {str(tok)[:16]}")
+                return tok
+        except Exception as e:
+            logger.debug(f"  ⚠ Falha ao disparar {tipo}: {e}")
+        return None
+
+    def _ai_poll_loop(self, ai_pending: List[dict], stop: threading.Event):
+        while not stop.wait(timeout=AI_POLL_INTERVAL):
+            logger.info("⏱ Polling IA — verificando materiais prontos...")
+            self._poll_and_download_ai(ai_pending)
+
+    def _poll_and_download_ai(self, ai_pending: List[dict]):
+        for entry in ai_pending:
+            lesson_dir = Path(entry['lesson_dir'])
+            mat_dir = create_folder(os.path.join(str(lesson_dir), 'material'))
+            mat_idx = entry.get('mat_idx', 99)
+
+            for tipo_key, nome_arquivo in [
+                ('token_transcricao', 'Transcrição IA'),
+                ('token_ebook', 'Ebook IA'),
+            ]:
+                tok = entry.get(tipo_key)
+                if not tok:
+                    continue
+                mat_file = os.path.join(mat_dir, f"{mat_idx:03d} - {nome_arquivo}.pdf")
+                if is_valid_pdf(mat_file):
+                    continue
+                url = f"{PORTAL_NEW}/getTranscricao?token={tok}&format=json"
+                if self._download_pdf(url, mat_file):
+                    logger.info(f"  ✓ IA pronto: {nome_arquivo} → {lesson_dir.name}")
+                    entry['mat_idx'] = mat_idx + 1
+                    mat_idx = entry['mat_idx']
+
+    # ---- Download vídeo (SEM DRM — fallback .mpd→.m3u8 já na coleta) -----
+    def _download_video(self, manifest_url: str, output_path: str, lesson_key: str):
+        rel_path = os.path.relpath(output_path, str(BASE_DIR))
+        temp_path = os.path.join(str(TEMP_DIR), rel_path)
+        os.makedirs(os.path.dirname(temp_path), exist_ok=True)
+
+        ydl_opts = {
+            'format': 'bestvideo+bestaudio/best',
+            'outtmpl': temp_path,
+            'quiet': True,
+            'no_warnings': True,
+            'retries': RETRY_ATTEMPTS,
+            'concurrent_fragment_downloads': 5,
+            'socket_timeout': TIMEOUT,
+            'ffmpeg_location': FFMPEG_DIR,
+            'merge_output_format': 'mp4',
+        }
+
+        # Cookies Netscape para yt-dlp
+        if self.cookies_file.exists():
+            ydl_opts['cookiefile'] = str(self.cookies_file)
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([manifest_url])
+
+            # yt-dlp pode adicionar extensão
+            downloaded = temp_path
+            if not os.path.exists(downloaded):
+                for ext in ('.mp4', '.mkv', '.webm', '.m4v'):
+                    if os.path.exists(downloaded + ext):
+                        downloaded = downloaded + ext
+                        break
+
+            if os.path.exists(downloaded) and os.path.getsize(downloaded) > 100 * 1024:
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                shutil.move(downloaded, output_path)
+                logger.info(f"  ✓ Vídeo: {os.path.basename(output_path)}")
+            else:
+                logger.warning(f"  ⚠ Arquivo inválido: {lesson_key}")
+        except Exception as e:
+            err = str(e).lower()
+            if any(x in err for x in ('drm', 'encrypted', 'widevine')):
+                logger.error(f"  🔒 DRM ativo (sem fallback .m3u8): {lesson_key}")
+            else:
+                logger.error(f"  ✗ Vídeo {lesson_key}: {str(e)[:120]}")
+
+    # ---- Download PDF ----------------------------------------------------
+    def _download_pdf(self, url: str, output_path: str) -> bool:
+        rel_path = os.path.relpath(output_path, str(BASE_DIR))
+        temp_path = os.path.join(str(TEMP_DIR), rel_path)
+        os.makedirs(os.path.dirname(temp_path), exist_ok=True)
+
+        for attempt in range(RETRY_ATTEMPTS):
+            try:
+                resp = self.session.get(url, timeout=TIMEOUT, verify=False, allow_redirects=True)
+                if resp.status_code != 200:
+                    time.sleep(2 ** attempt)
+                    continue
+
+                content_type = resp.headers.get('content-type', '').lower()
+
+                # JSON com URL interna
+                if 'application/json' in content_type or resp.content.startswith(b'{'):
+                    try:
+                        data = resp.json()
+                        target_url = None
+                        if isinstance(data, dict):
+                            target_url = (data.get('url') or data.get('link')
+                                          or data.get('path'))
+                        if target_url:
+                            if not target_url.startswith('http'):
+                                target_url = f"{BASE_URL}{quote(target_url, safe=':/')}"
+                            pdf_resp = self.session.get(target_url, stream=True,
+                                                        timeout=60, verify=False)
+                            if (pdf_resp.status_code == 200
+                                    and pdf_resp.content.startswith(b'%PDF')):
+                                with open(temp_path, 'wb') as f:
+                                    f.write(pdf_resp.content)
+                                shutil.move(temp_path, output_path)
+                                return True
+                    except Exception:
+                        pass
+
+                # PDF direto
+                if resp.content.startswith(b'%PDF'):
+                    with open(temp_path, 'wb') as f:
+                        f.write(resp.content)
+                    shutil.move(temp_path, output_path)
+                    return True
+
+                # HTML → Markdown (se vier HTML em vez de PDF)
+                if 'text/html' in content_type and resp.content:
+                    try:
+                        html_text = safe_decode(resp.content)
+                        if '<html' in html_text.lower() or '<p>' in html_text.lower():
+                            md_path = output_path.rsplit('.pdf', 1)[0] + '.md'
+                            md_content = html_to_markdown(html_text)
+                            with open(md_path, 'w', encoding='utf-8') as f:
+                                f.write(md_content)
+                            logger.info(f"  ✓ HTML→Markdown: {os.path.basename(md_path)}")
+                            return True
+                    except Exception:
+                        pass
+
+                time.sleep(2 ** attempt)
+            except Exception as e:
+                logger.debug(f"  PDF retry {attempt + 1}: {e}")
+                time.sleep(2 ** attempt)
+
+        logger.error(f"  ✗ PDF: {os.path.basename(output_path)}")
+        try:
+            with open(LOGS_DIR / 'failed_downloads.log', 'a', encoding='utf-8') as f:
+                f.write(f"{url}\n")
+        except Exception:
+            pass
+        return False
+
+    def close(self):
+        self.auth.close()
+
+
+# ============================================================================
+# START DOWNLOADS — usa AuthManager + PapaDownloader diretamente (sem import)
+# ============================================================================
+def start_downloads(creds: dict, courses: list) -> None:
+    """Inicia downloads usando PapaDownloader + AuthManager (classes locais)."""
+    # Cria AuthManager + seta cookies (3 domínios)
+    auth = AuthManager(use_selenium=False)
+    auth.login_cookies(creds["email"], creds["jsessionid"], creds["chave"])
+
+    # Cria PapaDownloader (sem DRM — fallback .mpd→.m3u8 funciona)
+    downloader = PapaDownloader(auth)
+
+    for i, course in enumerate(courses, 1):
+        logger.info(f"\n{'=' * 60}")
+        logger.info(f"CURSO {i}/{len(courses)}: {course.get('title', course['name'])}")
+        logger.info(f"{'=' * 60}")
+        try:
+            downloader.download_course(course["id"], course["name"])
+        except Exception as e:
+            logger.error(f"❌ Erro no curso {course['name']}: {e}")
+
+        # Pós-processamento: garante HTML5 + faststart
+        logger.info("🎬 Verificando vídeos para HTML5 + faststart...")
+        course_dir = os.path.join(
+            str(BASE_DIR),
+            clear_name(course.get('name', course.get('title', 'curso')))
+        )
+        if os.path.isdir(course_dir):
+            for root, dirs, files in os.walk(course_dir):
+                for f in files:
+                    if f.endswith('.mp4'):
+                        vpath = os.path.join(root, f)
+                        if is_video_complete(vpath):
+                            ensure_html5_faststart(vpath)
+
+    logger.info(f"\n{'=' * 60}")
+    logger.info(f"✅ Concluído: {len(courses)} cursos processados")
+    logger.info(f"{'=' * 60}")
+
+
+# ============================================================================
+# MENU
+# ============================================================================
+def show_menu(creds: dict, courses: list) -> list:
+    """Mostra menu e retorna cursos selecionados."""
+    print("\n" + "=" * 60)
+    print("  📚 PAPA CONCURSOS DOWNLOADER")
+    print("=" * 60)
+    print(f"\n  👤 Email: {creds.get('email', '?')}")
+    print(f"  🔑 Sessão: {'✅ Válida' if creds else '❌ Inválida'}")
+    print(f"\n  📋 {len(courses)} cursos disponíveis:\n")
+    for i, c in enumerate(courses, 1):
+        print(f"  {i:2d}. {c.get('title', c['name'])[:60]}")
+    print()
+    print("  OPÇÕES:")
+    print("   [Enter]  Baixar TODOS")
+    print("   [1-N]    Selecionar específicos (ex: 1,3,5)")
+    print("   [r]      Re-criar conta trial")
+    print("   [l]      Re-listar cursos")
+    print("   [q]      Sair")
+    print()
+    try:
+        choice = input("  Escolha: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return []
+    if choice == 'q':
+        return []
+    if choice == 'r':
+        new = create_new_trial_account()
+        if new:
+            creds.update(new)
+        return show_menu(creds, courses)
+    if choice == 'l':
+        session = create_session()
+        set_cookies_on_session(session, creds['email'], creds['jsessionid'], creds['chave'])
+        courses = discover_courses(session)
+        return show_menu(creds, courses)
+    if choice == '':
+        return courses
+    if ',' in choice:
+        indices = [int(x.strip()) - 1 for x in choice.split(',') if x.strip().isdigit()]
+        return [courses[i] for i in indices if 0 <= i < len(courses)]
+    if choice.isdigit():
+        idx = int(choice) - 1
+        if 0 <= idx < len(courses):
+            return [courses[idx]]
+    return courses
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+def main():
+    p = argparse.ArgumentParser(
+        description="Papa Concursos Downloader — código único integrado",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--autopilot", action="store_true", help="Baixa tudo sem menu")
+    p.add_argument("--check", action="store_true", help="Só verifica sessão")
+    p.add_argument("--recreate", action="store_true", help="Força criar nova conta trial")
+    p.add_argument("--list", action="store_true", help="Lista cursos disponíveis")
+    p.add_argument("--headless", action="store_true", help="Chrome headless (Selenium)")
+    args, _ = p.parse_known_args()
+
+    # AUTO-INSTALL + DETECÇÃO DE AMBIENTE (Windows/Mac/Linux/Colab)
+    install_dependencies()
+    detect_environment()
+
+    # --check
+    if args.check:
+        session = create_session()
+        set_cookies_on_session(session, HARDCODED_EMAIL, HARDCODED_JSESSIONID, HARDCODED_CHAVE)
+        if check_session(session):
+            logger.info("✅ Sessão válida!")
+            sys.exit(0)
+        logger.error("❌ Sessão expirada")
+        sys.exit(1)
+
+    # =========================================================================
+    # FLUXO PRINCIPAL — tenta reusar antes de criar nova conta
+    # =========================================================================
+    # 1. Carrega cookies salvos
+    saved = load_cookies_json()
+    creds = None
+
+    if saved and saved.get('jsessionid') and saved.get('chave'):
+        logger.info(f"🍪 Tentando cookies salvos: {saved['email']}")
+        session = create_session()
+        set_cookies_on_session(session, saved['email'], saved['jsessionid'], saved['chave'])
+        courses = discover_courses(session)
+
+        if courses:
+            # ✅ Cookies funcionam! Prossegue direto.
+            logger.info("✅ Cookies salvos funcionam!")
+            creds = saved
+        else:
+            # ❌ Cookies expiraram — tenta RE-LOGAR com email+senha salvos
+            logger.warning("⚠ Cookies expirados — tentando re-login com conta salva...")
+            if saved.get('password'):
+                # Tenta login Selenium com a mesma conta (não cria nova!)
+                is_colab = 'google.colab' in str(getattr(sys, 'modules', {}))
+                has_display = bool(os.environ.get('DISPLAY'))
+                new_creds = login_selenium(saved['email'], saved['password'], headless=(is_colab or not has_display))
+                if new_creds and new_creds.get('jsessionid'):
+                    # ✅ Login funcionou! Salva novos cookies e tenta de novo.
+                    logger.info("✅ Re-login funcionou! Salvando novos cookies...")
+                    save_cookies_json([], saved['email'], saved['password'])
+                    creds = new_creds
+                    session = create_session()
+                    set_cookies_on_session(session, creds['email'], creds['jsessionid'], creds['chave'])
+                    courses = discover_courses(session)
+                    if courses:
+                        logger.info("✅ Cursos encontrados após re-login!")
+                    else:
+                        logger.error("❌ Mesmo após re-login, sem cursos. Conta pode estar sem assinatura.")
+                        sys.exit(1)
+                else:
+                    logger.warning("⚠ Re-login falhou — criando nova conta trial...")
+            else:
+                logger.warning("⚠ Sem senha salva — criando nova conta trial...")
+
+    # 2. Se não tem cookies salvos OU re-login falhou → cria nova conta
+    if not creds or not creds.get('jsessionid'):
+        if args.recreate or not saved:
+            creds = create_new_trial_account()
+            if creds and creds.get('jsessionid'):
+                logger.info("✅ Nova conta criada — salva em cookies_papa.json")
+                session = create_session()
+                set_cookies_on_session(session, creds['email'], creds['jsessionid'], creds['chave'])
+                courses = discover_courses(session)
+            else:
+                logger.error("❌ Não consegui criar nova conta")
+                sys.exit(1)
+        else:
+            # Tenta hardcoded como último recurso
+            if HARDCODED_JSESSIONID and HARDCODED_CHAVE:
+                logger.info(f"🔑 Tentando hardcoded: {HARDCODED_EMAIL}")
+                creds = {"email": HARDCODED_EMAIL, "jsessionid": HARDCODED_JSESSIONID,
+                         "chave": HARDCODED_CHAVE}
+                session = create_session()
+                set_cookies_on_session(session, creds['email'], creds['jsessionid'], creds['chave'])
+                courses = discover_courses(session)
+                if not courses:
+                    logger.warning("⚠ Hardcoded expirado — criando nova conta trial...")
+                    creds = create_new_trial_account()
+                    if creds and creds.get('jsessionid'):
+                        session = create_session()
+                        set_cookies_on_session(session, creds['email'], creds['jsessionid'], creds['chave'])
+                        courses = discover_courses(session)
+            else:
+                creds = create_new_trial_account()
+                if creds and creds.get('jsessionid'):
+                    session = create_session()
+                    set_cookies_on_session(session, creds['email'], creds['jsessionid'], creds['chave'])
+                    courses = discover_courses(session)
+
+    # 3. Verifica se tem cursos
+    if not courses:
+        logger.error("❌ Nenhum curso encontrado após todas as tentativas")
+        logger.error("   Tente: python papa_downloader.py --recreate")
+        sys.exit(1)
+
+    # --list
+    if args.list:
+        sys.exit(0)
+
+    # --autopilot
+    if args.autopilot:
+        start_downloads(creds, courses)
+        return
+
+    # Menu interativo
+    selected = show_menu(creds, courses)
+    if selected:
+        start_downloads(creds, selected)
+
+
+if __name__ == "__main__":
+    main()
